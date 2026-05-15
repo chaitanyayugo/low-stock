@@ -2,9 +2,8 @@ name: Daily Low Stock Alert
 
 on:
   schedule:
-    # Runs daily at 8:00 AM UTC
     - cron: '0 8 * * *'
-  workflow_dispatch:   # Allows manual trigger from GitHub UI
+  workflow_dispatch:
 
 jobs:
   send-alert:
