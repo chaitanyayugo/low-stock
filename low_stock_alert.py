@@ -5,70 +5,74 @@ import smtplib
 import os
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from collections import defaultdict
 
-# ---------- CONFIGURATION (from environment variables) ----------
+print("🟢 Starting low‑stock alert script...")
+
+# ---------- CONFIGURATION ----------
 ODOO_URL = os.environ.get("ODOO_URL")
 ODOO_DB = os.environ.get("ODOO_DB")
 ODOO_USER = os.environ.get("ODOO_USER")
 ODOO_PASSWORD = os.environ.get("ODOO_PASSWORD")
 
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_HOST = os.environ.get("SMTP_HOST")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
 SMTP_USER = os.environ.get("SMTP_USER")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM = os.environ.get("SMTP_FROM")
-SMTP_TO = os.environ.get("SMTP_TO")   # can be comma-separated
+SMTP_TO = os.environ.get("SMTP_TO")
 
 # ---------- 1. CONNECT TO ODOO ----------
+print("🔌 Connecting to Odoo...")
 common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
 uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
+if not uid:
+    raise Exception("❌ Odoo authentication failed")
 models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+print("✅ Connected to Odoo")
 
 # ---------- 2. FETCH LOW STOCK QUANTS ----------
-domain = [
-    ["location_id.usage", "=", "internal"],
-    ["quantity", "<", 5]
-]
+print("📦 Fetching low‑stock quants...")
+domain = [["location_id.usage", "=", "internal"], ["quantity", "<", 5]]
 quants = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'stock.quant', 'search_read',
     [domain],
     {"fields": ["id", "product_id", "location_id", "quantity", "reserved_quantity"]}
 )
 
 if not quants:
-    print("✅ No low-stock products found. Exiting.")
+    print("✅ No low‑stock products found. Exiting.")
     exit(0)
 
-print(f"📦 Found {len(quants)} low-stock records.")
+print(f"📦 Found {len(quants)} low‑stock records. Unique products to process: {len(set(q['product_id'][0] for q in quants if q['product_id']))}")
 
 # ---------- 3. UNIQUE PRODUCT IDs ----------
 product_ids = list({q["product_id"][0] for q in quants if q["product_id"]})
+total_products = len(product_ids)
+print(f"🖼️ Will download images for {total_products} products.")
 
-# ---------- 4. FETCH IMAGES AS BASE64 ----------
+# ---------- 4. FETCH IMAGES WITH PROGRESS ----------
 def get_product_image_base64(product_id):
-    """Return data:image/png;base64,.... for a given product.id"""
     url = f"{ODOO_URL}/web/image/product.product/{product_id}/image_128"
     session = requests.Session()
-    # Basic auth works for Odoo's /web/image endpoint
     session.auth = (ODOO_USER, ODOO_PASSWORD)
     try:
         resp = session.get(url, timeout=10)
         if resp.status_code == 200:
             b64 = base64.b64encode(resp.content).decode('utf-8')
             return f"data:image/png;base64,{b64}"
-        else:
-            print(f"⚠️ No image for product {product_id}, using placeholder.")
-    except Exception as e:
-        print(f"⚠️ Error fetching image {product_id}: {e}")
-    # Transparent 1x1 pixel placeholder
+    except Exception:
+        pass
+    # transparent placeholder
     return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 
-print("🖼️ Downloading product images...")
 product_image_map = {}
-for pid in product_ids:
+for idx, pid in enumerate(product_ids, start=1):
     product_image_map[pid] = get_product_image_base64(pid)
+    if idx % 10 == 0 or idx == total_products:
+        print(f"   Progress: {idx}/{total_products} product images downloaded")
+print("✅ All images downloaded")
 
-# ---------- 5. BUILD EMAIL HTML TABLE ----------
+# ---------- 5. BUILD EMAIL HTML ----------
+print("📧 Building email HTML...")
 rows = ""
 for q in quants:
     product_id = q["product_id"][0]
@@ -77,7 +81,6 @@ for q in quants:
     quantity = q["quantity"]
     reserved = q["reserved_quantity"]
     img_src = product_image_map.get(product_id, "")
-
     rows += f"""
     <tr style="border-bottom:1px solid #eee;">
         <td style="padding:12px 15px; text-align:center;">
@@ -105,7 +108,7 @@ full_html = f"""
   <div style="max-width:800px; margin:0 auto; background:#fff; border-radius:8px; border:1px solid #e5e7eb;">
     <div style="background:#111827; padding:25px 30px;">
       <h1 style="color:#fff; margin:0;">⚠️ Inventory Alert: Low Stock Report</h1>
-      <p style="color:#9ca3af;">The following items are below the threshold of 5 units</p>
+      <p style="color:#9ca3af;">The following items are below threshold of 5 units</p>
     </div>
     <table style="width:100%; border-collapse:collapse;">
       <thead>
@@ -120,7 +123,7 @@ full_html = f"""
       <tbody>
         {rows}
       </tbody>
-    追赶
+    </table>
     <div style="padding:20px 30px; background:#fefefe; border-top:1px solid #eee; text-align:right;">
       <p style="margin:0; font-size:12px; color:#9ca3af;">Generated by GitHub Actions • {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M UTC')}</p>
     </div>
@@ -129,17 +132,16 @@ full_html = f"""
 """
 
 # ---------- 6. SEND EMAIL ----------
+print(f"📤 Sending email to {SMTP_TO}...")
 msg = MIMEMultipart("alternative")
 msg["Subject"] = f"Low Stock Alert – {__import__('datetime').datetime.now().strftime('%Y-%m-%d')}"
 msg["From"] = SMTP_FROM
 msg["To"] = SMTP_TO
+msg.attach(MIMEText(full_html, "html"))
 
-html_part = MIMEText(full_html, "html")
-msg.attach(html_part)
-
-with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
     server.starttls()
     server.login(SMTP_USER, SMTP_PASSWORD)
     server.send_message(msg)
 
-print(f"✅ Email sent successfully to {SMTP_TO}")
+print("✅ Email sent successfully")
