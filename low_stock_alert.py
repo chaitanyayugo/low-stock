@@ -231,7 +231,7 @@ for attempt in range(3):
             server.starttls()
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.send_message(msg)
-        print("✅ Email sent successfully", flush=True)
+        print("Email sent successfully", flush=True)
         break
     except Exception as e:
         print(f"   Attempt {attempt+1} failed: {e}", flush=True)
