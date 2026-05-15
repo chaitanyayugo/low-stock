@@ -1,100 +1,60 @@
 import xmlrpc.client
 import requests
 import base64
-import smtplib
 import os
-import time
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
-print("Starting low-stock alert script (TEST MODE - 10 products)...", flush=True)
+print("Diagnostic: Fetching one product image from Odoo", flush=True)
 
 ODOO_URL = os.environ.get("ODOO_URL")
 ODOO_DB = os.environ.get("ODOO_DB")
 ODOO_USER = os.environ.get("ODOO_USER")
 ODOO_PASSWORD = os.environ.get("ODOO_PASSWORD")
 
-SMTP_HOST = os.environ.get("SMTP_HOST")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
-SMTP_USER = os.environ.get("SMTP_USER")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
-SMTP_FROM = os.environ.get("SMTP_FROM")
-SMTP_TO = os.environ.get("SMTP_TO")
-
-print("Connecting to Odoo...", flush=True)
+# Connect to Odoo
 common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
 uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
 if not uid:
-    raise Exception("Odoo authentication failed")
+    raise Exception("Authentication failed")
 models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
-print("Connected to Odoo", flush=True)
 
-print("Fetching low-stock quants...", flush=True)
-domain = [
-    ["location_id.usage", "=", "internal"],
-    ["quantity", "<", 5]
-]
+# Get first low-stock quant
+domain = [["location_id.usage", "=", "internal"], ["quantity", "<", 5]]
 quants = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'stock.quant', 'search_read',
-    [domain],
-    {"fields": ["id", "product_id", "location_id", "quantity", "reserved_quantity"]}
-)
-
+    [domain], {"fields": ["product_id"], "limit": 1})
 if not quants:
-    print("No low-stock products found. Exiting.", flush=True)
+    print("No low-stock products")
     exit(0)
 
-print(f"Found {len(quants)} low-stock records.", flush=True)
+product_id = quants[0]['product_id'][0]
+product_name = quants[0]['product_id'][1]
+print(f"Testing product: {product_name} (ID: {product_id})", flush=True)
 
-quants_sorted = sorted(quants, key=lambda q: q['quantity'])
-TOP_LIMIT = 10
-quants_limited = quants_sorted[:TOP_LIMIT]
+# Try to fetch image
+url = f"{ODOO_URL}/web/image/product.product/{product_id}/image_128"
+print(f"URL: {url}", flush=True)
 
-product_ids = list({q["product_id"][0] for q in quants_limited if q["product_id"]})
-print(f"Will download images for {len(product_ids)} products.", flush=True)
+session = requests.Session()
+session.auth = (ODOO_USER, ODOO_PASSWORD)
+resp = session.get(url, timeout=10)
 
-# ------------------------------------------------------------------
-# Function to fetch image (variant first, then template)
-# ------------------------------------------------------------------
-def fetch_product_image(product_id):
-    session = requests.Session()
-    session.auth = (ODOO_USER, ODOO_PASSWORD)
-    # Try variant image
-    url_var = f"{ODOO_URL}/web/image/product.product/{product_id}/image_128"
-    try:
-        resp = session.get(url_var, timeout=10)
-        if resp.status_code == 200 and len(resp.content) > 50:
-            b64 = base64.b64encode(resp.content).decode('utf-8')
-            return f"data:image/png;base64,{b64}"
-    except:
-        pass
-    # If variant has no image, try template
-    try:
-        # Get template id from variant
-        variant_data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read',
-                                         [product_id], ['product_tmpl_id'])
-        if variant_data and variant_data[0].get('product_tmpl_id'):
-            tmpl_id = variant_data[0]['product_tmpl_id'][0]
-            url_tmpl = f"{ODOO_URL}/web/image/product.template/{tmpl_id}/image_128"
-            resp = session.get(url_tmpl, timeout=10)
-            if resp.status_code == 200 and len(resp.content) > 50:
-                b64 = base64.b64encode(resp.content).decode('utf-8')
-                return f"data:image/png;base64,{b64}"
-    except:
-        pass
-    return ""  # No image at all
+print(f"Status code: {resp.status_code}", flush=True)
+print(f"Content length: {len(resp.content)} bytes", flush=True)
+print(f"First 50 bytes: {resp.content[:50]}", flush=True)
 
-# ------------------------------------------------------------------
-# Build product_image_map dictionary
-# ------------------------------------------------------------------
-product_image_map = {}
-for idx, pid in enumerate(product_ids, 1):
-    product_image_map[pid] = fetch_product_image(pid)
-    print(f"   Processed {idx}/{len(product_ids)}", flush=True)
-print("Image fetching done", flush=True)
-
-# ------------------------------------------------------------------
-# Build email HTML
-# ------------------------------------------------------------------
+if resp.status_code == 200 and len(resp.content) > 100:
+    b64 = base64.b64encode(resp.content).decode('utf-8')[:100]
+    print(f"Base64 (first 100 chars): {b64}", flush=True)
+else:
+    print("Image not found or too small", flush=True)
+    # Also try template
+    variant_data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read',
+                                     [product_id], ['product_tmpl_id'])
+    if variant_data and variant_data[0].get('product_tmpl_id'):
+        tmpl_id = variant_data[0]['product_tmpl_id'][0]
+        url_tmpl = f"{ODOO_URL}/web/image/product.template/{tmpl_id}/image_128"
+        print(f"Trying template URL: {url_tmpl}", flush=True)
+        resp2 = session.get(url_tmpl, timeout=10)
+        print(f"Template status: {resp2.status_code}, length: {len(resp2.content)}", flush=True)# ------------------------------------------------------------------
 print("Building HTML...", flush=True)
 rows = ""
 for q in quants_limited:
