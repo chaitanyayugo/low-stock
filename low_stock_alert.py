@@ -59,14 +59,19 @@ print(f"🖼️ Will download images for {len(product_ids)} products (limit {TOP
 
 # ---------- 4. FETCH IMAGES (only those 10 products) ----------
 # Create a simple gray placeholder image (100x100)
-import io
-from PIL import Image
-
-def create_placeholder():
-    img = Image.new('RGB', (100, 100), color='#cccccc')
-    buffered = io.BytesIO()
-    img.save(buffered, format="PNG")
-    return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
+def get_product_image_base64(product_id):
+    url = f"{ODOO_URL}/web/image/product.product/{product_id}/image_128"
+    session = requests.Session()
+    session.auth = (ODOO_USER, ODOO_PASSWORD)
+    try:
+        resp = session.get(url, timeout=10)
+        if resp.status_code == 200:
+            b64 = base64.b64encode(resp.content).decode('utf-8')
+            return f"data:image/png;base64,{b64}"
+    except Exception:
+        pass
+    # Return a visible gray placeholder (no PIL needed)
+    return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGQAAABkCAYAAABw4pVUAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAZdEVYdFNvZnR3YXJlAHBhaW50Lm5ldCA0LjAuMTM0A1t6AAAAI0lEQVR4nO3BMQEAAADCoPVPbQhfoAAAAAAAAAAAAAAAAAAAAIC3AcEAAAEh/8aYAAAAAElFTkSuQmCC"
 
 # ---------- 5. BUILD EMAIL HTML ----------
 print("📧 Building email HTML...", flush=True)
