@@ -58,25 +58,15 @@ product_ids = list({q["product_id"][0] for q in quants_limited if q["product_id"
 print(f"🖼️ Will download images for {len(product_ids)} products (limit {TOP_LIMIT}).", flush=True)
 
 # ---------- 4. FETCH IMAGES (only those 10 products) ----------
-def get_product_image_base64(product_id):
-    url = f"{ODOO_URL}/web/image/product.product/{product_id}/image_128"
-    session = requests.Session()
-    session.auth = (ODOO_USER, ODOO_PASSWORD)
-    try:
-        resp = session.get(url, timeout=10)
-        if resp.status_code == 200:
-            b64 = base64.b64encode(resp.content).decode('utf-8')
-            return f"data:image/png;base64,{b64}"
-    except Exception as e:
-        print(f"   ⚠️ Image download failed for product {product_id}: {e}", flush=True)
-    # transparent 1x1 placeholder
-    return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+# Create a simple gray placeholder image (100x100)
+import io
+from PIL import Image
 
-product_image_map = {}
-for idx, pid in enumerate(product_ids, start=1):
-    product_image_map[pid] = get_product_image_base64(pid)
-    print(f"   Downloaded image {idx}/{len(product_ids)}", flush=True)
-print("✅ All images downloaded", flush=True)
+def create_placeholder():
+    img = Image.new('RGB', (100, 100), color='#cccccc')
+    buffered = io.BytesIO()
+    img.save(buffered, format="PNG")
+    return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
 
 # ---------- 5. BUILD EMAIL HTML ----------
 print("📧 Building email HTML...", flush=True)
