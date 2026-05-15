@@ -50,28 +50,30 @@ TOP_LIMIT = 10
 quants_limited = quants_sorted[:TOP_LIMIT]
 
 product_ids = list({q["product_id"][0] for q in quants_limited if q["product_id"]})
-print(f"Will download images for {len(product_ids)} products (limit {TOP_LIMIT}).", flush=True)
+print(f"Will download images for {len(product_ids)} products.", flush=True)
 
+# ------------------------------------------------------------------
+# Function to fetch image (variant first, then template)
+# ------------------------------------------------------------------
 def fetch_product_image(product_id):
-    # First try the variant itself
-    url = f"{ODOO_URL}/web/image/product.product/{product_id}/image_128"
     session = requests.Session()
     session.auth = (ODOO_USER, ODOO_PASSWORD)
+    # Try variant image
+    url_var = f"{ODOO_URL}/web/image/product.product/{product_id}/image_128"
     try:
-        resp = session.get(url, timeout=10)
-        if resp.status_code == 200 and len(resp.content) > 50:  # reduced threshold
+        resp = session.get(url_var, timeout=10)
+        if resp.status_code == 200 and len(resp.content) > 50:
             b64 = base64.b64encode(resp.content).decode('utf-8')
             return f"data:image/png;base64,{b64}"
     except:
         pass
-    
-    # If variant has no image, try the product template
-    # First get the template ID from the variant
+    # If variant has no image, try template
     try:
-        variant_info = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read',
-            [product_id], ['product_tmpl_id'])
-        if variant_info and variant_info[0].get('product_tmpl_id'):
-            tmpl_id = variant_info[0]['product_tmpl_id'][0]
+        # Get template id from variant
+        variant_data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read',
+                                         [product_id], ['product_tmpl_id'])
+        if variant_data and variant_data[0].get('product_tmpl_id'):
+            tmpl_id = variant_data[0]['product_tmpl_id'][0]
             url_tmpl = f"{ODOO_URL}/web/image/product.template/{tmpl_id}/image_128"
             resp = session.get(url_tmpl, timeout=10)
             if resp.status_code == 200 and len(resp.content) > 50:
@@ -79,9 +81,20 @@ def fetch_product_image(product_id):
                 return f"data:image/png;base64,{b64}"
     except:
         pass
-    
     return ""  # No image at all
 
+# ------------------------------------------------------------------
+# Build product_image_map dictionary
+# ------------------------------------------------------------------
+product_image_map = {}
+for idx, pid in enumerate(product_ids, 1):
+    product_image_map[pid] = fetch_product_image(pid)
+    print(f"   Processed {idx}/{len(product_ids)}", flush=True)
+print("Image fetching done", flush=True)
+
+# ------------------------------------------------------------------
+# Build email HTML
+# ------------------------------------------------------------------
 print("Building HTML...", flush=True)
 rows = ""
 for q in quants_limited:
