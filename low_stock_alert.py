@@ -3,11 +3,10 @@ import requests
 import base64
 import smtplib
 import os
-import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-print("TEST: Fetching CH-625 dining chair image", flush=True)
+print("Simple test for CH-625 dining chair")
 
 ODOO_URL = os.environ.get("ODOO_URL")
 ODOO_DB = os.environ.get("ODOO_DB")
@@ -21,80 +20,53 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM = os.environ.get("SMTP_FROM")
 SMTP_TO = os.environ.get("SMTP_TO")
 
-# Connect
+# Connect to Odoo
 common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
 uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
-if not uid:
-    raise Exception("Auth failed")
 models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
 # Find product by name
 product_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'search',
-                                [[['name', 'ilike', 'CH-625 dining chair']]], {'limit': 1})
+    [[['name', 'ilike', 'CH-625']]], {'limit': 1})
 if not product_ids:
     print("Product not found")
     exit(1)
 
-product_id = product_ids[0]
-# Get product details
-prod = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read',
-                         [product_id], ['name', 'qty_available'])
-product_name = prod[0]['name']
-qty = prod[0].get('qty_available', 0)
+pid = product_ids[0]
 
-print(f"Found: {product_name} (ID: {product_id}), stock: {qty}", flush=True)
+# Fetch image
+url = f"{ODOO_URL}/web/image/product.product/{pid}/image_128"
+session = requests.Session()
+session.auth = (ODOO_USER, ODOO_PASSWORD)
+resp = session.get(url, timeout=10)
 
-# Fetch image (variant then template)
-def get_image(product_id):
-    session = requests.Session()
-    session.auth = (ODOO_USER, ODOO_PASSWORD)
-    # Variant
-    url = f"{ODOO_URL}/web/image/product.product/{product_id}/image_128"
-    resp = session.get(url, timeout=10)
-    if resp.status_code == 200 and len(resp.content) > 100:
-        return f"data:image/png;base64,{base64.b64encode(resp.content).decode()}"
-    # Template fallback
-    variant_data = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read',
-                                     [product_id], ['product_tmpl_id'])
-    if variant_data and variant_data[0].get('product_tmpl_id'):
-        tmpl_id = variant_data[0]['product_tmpl_id'][0]
-        url_tmpl = f"{ODOO_URL}/web/image/product.template/{tmpl_id}/image_128"
-        resp = session.get(url_tmpl, timeout=10)
-        if resp.status_code == 200 and len(resp.content) > 100:
-            return f"data:image/png;base64,{base64.b64encode(resp.content).decode()}"
-    return ""
-
-img_src = get_image(product_id)
-if img_src:
-    print("Image fetched successfully", flush=True)
+if resp.status_code == 200 and len(resp.content) > 100:
+    b64 = base64.b64encode(resp.content).decode('utf-8')
+    img_src = f"data:image/png;base64,{b64}"
+    print("Image fetched, size:", len(resp.content))
 else:
-    print("No image found", flush=True)
+    img_src = ""
+    print("No image found")
 
-# Build email
-rows = f"""
-<tr style="border-bottom:1px solid #eee;">
-    <td style="padding:12px 15px; text-align:center;">
-        <img src="{img_src}" style="width:80px; height:80px; object-fit:cover; border-radius:6px;">
-    </td>
-    <td style="padding:12px 15px; font-family:Helvetica; font-size:14px;">
-        {product_name}
-    </td>
-    <td style="padding:12px 15px; text-align:center;">
-        {qty}
-    </td>
-</tr>
-"""
+# Build email HTML as a simple string
+html = """<html><body><h2>Test Product</h2>
+<img src="IMAGE_PLACEHOLDER" style="width:100px;"/>
+<p>If you see an image, the script works.</p>
+</body></html>""".replace("IMAGE_PLACEHOLDER", img_src)
 
-full_html = f"""
-<div style="background:#f9fafb; padding:40px 10px;">
-  <div style="max-width:600px; margin:0 auto; background:#fff; border-radius:8px;">
-    <div style="background:#111827; padding:20px;">
-      <h1 style="color:#fff;">Test: Single Product Image</h1>
-    </div>
-    <table style="width:100%; border-collapse:collapse;">
-      <thead>
-        <tr><th>Image</th><th>Product</th><th>Stock</th></tr>
-      </thead>
+# Send email
+msg = MIMEMultipart("alternative")
+msg["Subject"] = "Test Image for CH-625"
+msg["From"] = SMTP_FROM
+msg["To"] = SMTP_TO
+msg.attach(MIMEText(html, "html"))
+
+with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+    server.starttls()
+    server.login(SMTP_USER, SMTP_PASSWORD)
+    server.send_message(msg)
+
+print("Email sent")      </thead>
       <tbody>{rows}</tbody>
     </table>
     <div style="padding:20px; text-align:center;">
