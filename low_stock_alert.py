@@ -53,23 +53,34 @@ product_ids = list({q["product_id"][0] for q in quants_limited if q["product_id"
 print(f"Will download images for {len(product_ids)} products (limit {TOP_LIMIT}).", flush=True)
 
 def fetch_product_image(product_id):
+    # First try the variant itself
     url = f"{ODOO_URL}/web/image/product.product/{product_id}/image_128"
     session = requests.Session()
     session.auth = (ODOO_USER, ODOO_PASSWORD)
     try:
         resp = session.get(url, timeout=10)
-        if resp.status_code == 200 and len(resp.content) > 100:
+        if resp.status_code == 200 and len(resp.content) > 50:  # reduced threshold
             b64 = base64.b64encode(resp.content).decode('utf-8')
             return f"data:image/png;base64,{b64}"
     except:
         pass
-    return ""
-
-product_image_map = {}
-for idx, pid in enumerate(product_ids, 1):
-    product_image_map[pid] = fetch_product_image(pid)
-    print(f"   Processed {idx}/{len(product_ids)}", flush=True)
-print("Image fetching done", flush=True)
+    
+    # If variant has no image, try the product template
+    # First get the template ID from the variant
+    try:
+        variant_info = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'read',
+            [product_id], ['product_tmpl_id'])
+        if variant_info and variant_info[0].get('product_tmpl_id'):
+            tmpl_id = variant_info[0]['product_tmpl_id'][0]
+            url_tmpl = f"{ODOO_URL}/web/image/product.template/{tmpl_id}/image_128"
+            resp = session.get(url_tmpl, timeout=10)
+            if resp.status_code == 200 and len(resp.content) > 50:
+                b64 = base64.b64encode(resp.content).decode('utf-8')
+                return f"data:image/png;base64,{b64}"
+    except:
+        pass
+    
+    return ""  # No image at all
 
 print("Building HTML...", flush=True)
 rows = ""
