@@ -9,6 +9,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
 
 print("🟢 Starting ELITE low-stock alert script...", flush=True)
 
@@ -52,6 +53,12 @@ AVATAR_COLORS = [
     "#2c4a7c", "#1a3a5c", "#2d6a4f", "#1b4332",
 ]
 
+# 1×1 transparent PNG fallback (used when a product has no image)
+FALLBACK_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAA"
+    "DUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+
 
 # ─────────────────────────────────────────────
 #  HELPERS
@@ -65,8 +72,11 @@ def avatar_color(name: str) -> str:
     return AVATAR_COLORS[idx]
 
 
-def letter_avatar_uri(name: str) -> str:
-    """Gold-tinted inline SVG letter avatar — zero attachments."""
+def letter_avatar_svg_bytes(name: str) -> bytes:
+    """
+    Return raw SVG bytes for a gold letter avatar.
+    Attached as a MIMEImage just like a real product image.
+    """
     letter = (name or "?")[0].upper()
     color  = avatar_color(name)
     svg = (
@@ -85,13 +95,7 @@ def letter_avatar_uri(name: str) -> str:
         f'font-weight="700" fill="#e8c96d">{letter}</text>'
         f'</svg>'
     )
-    b64 = base64.b64encode(svg.encode()).decode()
-    return f"data:image/svg+xml;base64,{b64}"
-
-
-def img_to_data_uri(img_bytes: bytes) -> str:
-    b64 = base64.b64encode(img_bytes).decode()
-    return f"data:image/png;base64,{b64}"
+    return svg.encode()
 
 
 def stock_level(qty: float) -> str:
@@ -152,34 +156,72 @@ def subcateg_name(p: dict) -> str:
     Falls back to the full path if no split keyword found.
     """
     full = categ_path(p)
-    # Strip everything up to and including the first match of any split keyword
     for _, kw in SPLIT_GROUPS:
         pattern = re.compile(re.escape(kw), re.IGNORECASE)
         m = pattern.search(full)
         if m:
             remainder = full[m.end():]
-            # Trim leading separators like " / "
             remainder = re.sub(r'^\s*/\s*', '', remainder).strip()
             return remainder or full
     return full
 
 
 # ─────────────────────────────────────────────
+#  IMAGE DECODING
+#  Proven approach from the working test script:
+#  sanitise the base64 string then decode to raw bytes.
+#  xmlrpc.client.Binary objects are handled explicitly.
+# ─────────────────────────────────────────────
+def decode_image(raw_img) -> bytes | None:
+    """
+    Return raw image bytes from whatever xmlrpc.client gives us, or None.
+
+    Odoo XML-RPC can return image fields as:
+      • xmlrpc.client.Binary  →  .data holds raw bytes already
+      • str                   →  base64-encoded string
+      • bytes                 →  base64-encoded bytes (rare)
+      • False / None          →  no image
+    """
+    try:
+        if not raw_img or str(raw_img) == "False":
+            return None
+
+        # Case 1: xmlrpc.client.Binary — .data is already raw bytes
+        if isinstance(raw_img, xmlrpc.client.Binary):
+            return raw_img.data
+
+        # Case 2: str — base64-encoded string (most common in practice)
+        if isinstance(raw_img, str):
+            cleaned = raw_img.replace("\n", "").replace("\r", "").strip()
+            return base64.b64decode(cleaned)
+
+        # Case 3: bytes — base64-encoded bytes
+        if isinstance(raw_img, bytes):
+            cleaned = raw_img.replace(b"\n", b"").replace(b"\r", b"").strip()
+            return base64.b64decode(cleaned)
+
+    except Exception:
+        return None
+
+    return None
+
+
+# ─────────────────────────────────────────────
 #  HTML BUILDER  —  100 % Gmail-safe, zero JS
 #
-#  Gmail strips ALL <script> and interactive CSS.
+#  Images referenced as  cid:product_<id>
+#  resolved by MIMEImage parts added in send_email().
+#
 #  Layout strategy:
 #    • 3 colour-coded stock-level bands: OUT → CRITICAL → LOW
 #    • Within each band: sub-categories sorted A-Z / 0-9
 #    • Within each sub-category: products sorted A-Z / 0-9 → qty asc
-#    • No product index, no search box (Gmail can't support either)
 #    • Pure luxury design: deep obsidian + gold dividers + serif accents
 # ─────────────────────────────────────────────
 def build_html(
     products: list,
     qty_field: str,
-    product_data_uris: dict,
-    group_label: str,          # "Imported" | "Indian"
+    group_label: str,
     total_products: int,
     total_subcategories: int,
     out_count: int,
@@ -196,8 +238,8 @@ def build_html(
         "low":      defaultdict(list),
     }
     for p in products:
-        qty  = float(p.get(qty_field) or 0)
-        sub  = subcateg_name(p) or "General"
+        qty = float(p.get(qty_field) or 0)
+        sub = subcateg_name(p) or "General"
         by_level[stock_level(qty)][sub].append(p)
 
     # ── Decorative gold divider line ─────────────────────────────────────
@@ -300,25 +342,17 @@ def build_html(
 
             # ── Product rows ──────────────────────────────────────────────
             for idx, p in enumerate(cat_products):
-                qty   = float(p.get(qty_field) or 0)
-                uri   = product_data_uris.get(p["id"], "")
-                badge = stock_badge(qty)
-                name  = esc(p["name"] or "—")
+                qty    = float(p.get(qty_field) or 0)
+                badge  = stock_badge(qty)
+                name   = esc(p["name"] or "—")
                 row_bg = "#08080f" if idx % 2 == 0 else "#060609"
+                cid    = f"product_{p['id']}"
 
-                if uri:
-                    img_tag = (
-                        f'<img src="{uri}" width="44" height="44" '
-                        f'style="width:44px;height:44px;border-radius:8px;'
-                        f'object-fit:cover;display:block;border:1px solid #c9a84c22;" alt="">'
-                    )
-                else:
-                    av_uri = letter_avatar_uri(p["name"] or "?")
-                    img_tag = (
-                        f'<img src="{av_uri}" width="44" height="44" '
-                        f'style="width:44px;height:44px;border-radius:8px;'
-                        f'display:block;" alt="">'
-                    )
+                img_tag = (
+                    f'<img src="cid:{cid}" width="44" height="44" '
+                    f'style="width:44px;height:44px;border-radius:8px;'
+                    f'object-fit:cover;display:block;border:1px solid #c9a84c22;" alt="">'
+                )
 
                 sections_html += f"""
         <tr style="background:{row_bg};">
@@ -340,11 +374,7 @@ def build_html(
         </tr>
         {GOLD_LINE}"""
 
-    # ── Compose full HTML ─────────────────────────────────────────────────
-    # Decorative header monogram
-    monogram = group_label[0].upper() if group_label else "I"
-
-    # Label display
+    monogram    = group_label[0].upper() if group_label else "I"
     label_upper = group_label.upper()
 
     return f"""<!DOCTYPE html>
@@ -371,13 +401,11 @@ def build_html(
                  border:1px solid #c9a84c33;
                  padding:0;">
 
-        <!-- Gold top accent bar -->
         <div style="height:2px;background:linear-gradient(90deg,transparent,#c9a84c,#e8d48b,#c9a84c,transparent);
                     border-radius:16px 16px 0 0;"></div>
 
         <table width="100%" cellpadding="0" cellspacing="0">
           <tr>
-            <!-- Monogram circle -->
             <td width="90" style="padding:28px 0 28px 28px;vertical-align:top;">
               <div style="width:62px;height:62px;border-radius:50%;
                           background:linear-gradient(135deg,#1a1400,#0a0a0f);
@@ -389,7 +417,6 @@ def build_html(
               </div>
             </td>
 
-            <!-- Title block -->
             <td style="padding:28px 0 28px 12px;vertical-align:top;">
               <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
                           font-size:9px;font-weight:700;letter-spacing:4px;
@@ -412,7 +439,6 @@ def build_html(
               </div>
             </td>
 
-            <!-- Warning icon -->
             <td align="right" valign="top" style="padding:28px 28px 28px 0;">
               <div style="width:46px;height:46px;border-radius:50%;
                           background:linear-gradient(135deg,#2a0008,#0a0008);
@@ -422,7 +448,6 @@ def build_html(
           </tr>
         </table>
 
-        <!-- Gold separator -->
         <div style="height:1px;margin:0 28px;
                     background:linear-gradient(90deg,transparent,#c9a84c55,#c9a84c88,#c9a84c55,transparent);">
         </div>
@@ -439,7 +464,6 @@ def build_html(
                  border-right:1px solid #c9a84c33;">
         <table width="100%" cellpadding="0" cellspacing="0">
           <tr>
-            <!-- Total products -->
             <td width="25%" style="padding:20px 0;text-align:center;
                 border-right:1px solid #c9a84c22;">
               <div style="font-family:Georgia,'Times New Roman',serif;
@@ -453,7 +477,6 @@ def build_html(
                 Products
               </div>
             </td>
-            <!-- Sub-categories -->
             <td width="25%" style="padding:20px 0;text-align:center;
                 border-right:1px solid #c9a84c22;">
               <div style="font-family:Georgia,'Times New Roman',serif;
@@ -467,7 +490,6 @@ def build_html(
                 Sub-Categories
               </div>
             </td>
-            <!-- Critical -->
             <td width="25%" style="padding:20px 0;text-align:center;
                 border-right:1px solid #c9a84c22;">
               <div style="font-family:Georgia,'Times New Roman',serif;
@@ -481,7 +503,6 @@ def build_html(
                 Critical
               </div>
             </td>
-            <!-- Out of stock -->
             <td width="25%" style="padding:20px 0;text-align:center;">
               <div style="font-family:Georgia,'Times New Roman',serif;
                           font-size:30px;font-weight:700;
@@ -550,7 +571,6 @@ def build_html(
                  border-radius:0 0 16px 16px;
                  padding:0;">
 
-        <!-- Gold bottom accent bar -->
         <div style="height:1px;
                     background:linear-gradient(90deg,transparent,#c9a84c44,#c9a84c66,#c9a84c44,transparent);">
         </div>
@@ -577,7 +597,6 @@ def build_html(
           </tr>
         </table>
 
-        <!-- Gold bottom bar -->
         <div style="height:2px;
                     background:linear-gradient(90deg,transparent,#c9a84c,#e8d48b,#c9a84c,transparent);
                     border-radius:0 0 16px 16px;">
@@ -595,19 +614,49 @@ def build_html(
 
 
 # ─────────────────────────────────────────────
-#  SEND — zero attachments, plain HTML only
+#  SEND
+#  Structure (proven from working test script):
+#    multipart/related          ← ties HTML body to its inline images
+#    ├── multipart/alternative  ← best-practice HTML wrapper
+#    │   └── text/html
+#    └── image/png  cid:product_<id>   ← one part per product in this group
 # ─────────────────────────────────────────────
-def send_email(html: str, subject: str) -> None:
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = SMTP_FROM
-    msg["To"]      = SMTP_TO
-    msg.attach(MIMEText(html, "html"))
+def send_email(
+    html: str,
+    subject: str,
+    image_map: dict,   # { product_id (int): raw bytes }
+) -> None:
+
+    msg_related = MIMEMultipart("related")
+    msg_related["Subject"] = subject
+    msg_related["From"]    = SMTP_FROM
+    msg_related["To"]      = SMTP_TO
+
+    # HTML body
+    msg_alt = MIMEMultipart("alternative")
+    msg_alt.attach(MIMEText(html, "html"))
+    msg_related.attach(msg_alt)
+
+    # One inline image part per unique product_id in this group
+    for product_id, img_bytes in image_map.items():
+        try:
+            # SVG avatars vs PNG product images
+            if img_bytes[:4] == b"<svg":
+                img_part = MIMEImage(img_bytes, _subtype="svg+xml")
+            else:
+                img_part = MIMEImage(img_bytes, _subtype="png")
+            img_part.add_header("Content-ID",          f"<product_{product_id}>")
+            img_part.add_header("Content-Disposition", "inline",
+                                filename=f"product_{product_id}.png")
+            msg_related.attach(img_part)
+        except Exception as e:
+            print(f"   ⚠️  Could not attach image for product {product_id}: {e}", flush=True)
+
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
         server.ehlo()
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg)
+        server.send_message(msg_related)
 
 
 # ─────────────────────────────────────────────
@@ -639,9 +688,9 @@ for candidate in QTY_FIELD_CANDIDATES:
             ODOO_DB, uid, ODOO_PASSWORD,
             "product.product", "search_read",
             [[
-                ("active",    "=", True),
-                (candidate,   "<", LOW_STOCK_THRESHOLD),
-                (candidate,  ">=", 0),
+                ("active",   "=", True),
+                (candidate,  "<", LOW_STOCK_THRESHOLD),
+                (candidate, ">=", 0),
             ]],
             {"fields": base_fields + [candidate], "limit": 0},
         )
@@ -671,69 +720,39 @@ print(f"📦 Found {len(all_products)} low-stock product(s).", flush=True)
 
 
 # ─────────────────────────────────────────────
-#  3. IMAGES → INLINE DATA URIs  (zero attachments)
-#
-#  FIX: xmlrpc.client returns Odoo binary fields as xmlrpc.client.Binary
-#  objects (not plain bytes or base64 strings). Calling .data on a Binary
-#  gives the raw bytes directly — no base64 decode needed.
-#  For safety we also handle the case where Odoo returns a plain base64
-#  string (some versions / configurations do this).
+#  3. DECODE IMAGES
+#  Build a map: product_id → raw bytes
+#  Identical image data is deduplicated by MD5 hash so the same
+#  bytes are never stored twice in memory, but every product_id
+#  still gets its own entry (needed for CID lookup in send_email).
 # ─────────────────────────────────────────────
-print("🖼️  Converting images to inline data URIs...", flush=True)
+print("🖼️  Decoding product images...", flush=True)
 
-hash_to_uri:       dict[str, str] = {}
-product_data_uris: dict[int, str] = {}
+hash_to_bytes:   dict[str, bytes] = {}   # md5 → canonical raw bytes
+product_img_map: dict[int, bytes] = {}   # product_id → raw bytes
 
 for p in all_products:
-    p_id    = p["id"]
-    raw_img = p.get("image_512")
-    try:
-        if raw_img and raw_img is not False and str(raw_img) != "False":
+    p_id      = p["id"]
+    img_bytes = decode_image(p.get("image_512"))
 
-            # ── Case 1: xmlrpc.client.Binary (most common with Odoo XML-RPC)
-            if isinstance(raw_img, xmlrpc.client.Binary):
-                img_bytes = raw_img.data          # already raw bytes — no decode
+    if img_bytes:
+        h = hashlib.md5(img_bytes).hexdigest()
+        if h not in hash_to_bytes:
+            hash_to_bytes[h] = img_bytes
+        product_img_map[p_id] = hash_to_bytes[h]
+    else:
+        # Letter-avatar SVG as fallback — unique per product name
+        product_img_map[p_id] = letter_avatar_svg_bytes(p["name"] or "?")
 
-            # ── Case 2: plain bytes — treat as raw image bytes directly
-            elif isinstance(raw_img, bytes):
-                # Try to base64-decode; if it fails the bytes ARE the image
-                try:
-                    img_bytes = base64.b64decode(raw_img, validate=True)
-                except Exception:
-                    img_bytes = raw_img
-
-            # ── Case 3: string — must be a base64-encoded image
-            elif isinstance(raw_img, str):
-                cleaned = raw_img.replace("\n", "").replace("\r", "").strip()
-                img_bytes = base64.b64decode(cleaned)
-
-            else:
-                product_data_uris[p_id] = ""
-                continue
-
-            # Deduplicate identical images
-            h = hashlib.md5(img_bytes).hexdigest()
-            if h not in hash_to_uri:
-                hash_to_uri[h] = img_to_data_uri(img_bytes)
-            product_data_uris[p_id] = hash_to_uri[h]
-
-        else:
-            product_data_uris[p_id] = ""
-
-    except Exception as exc:
-        print(f"   ⚠️  Bad image for product {p_id}: {exc}", flush=True)
-        product_data_uris[p_id] = ""
-
-print(f"   ↳ {len(all_products)} products → {len(hash_to_uri)} unique image(s).", flush=True)
+print(
+    f"   ↳ {len(all_products)} products → "
+    f"{len(hash_to_bytes)} unique real image(s).",
+    flush=True,
+)
 
 
 # ─────────────────────────────────────────────
 #  4. SPLIT BY PARENT CATEGORY KEYWORD
-#
-#  Odoo returns categ_id as [id, "Full / Path / Name"].
-#  We match the full path string (case-insensitive) against each
-#  group's keyword.  A product is assigned to the FIRST keyword it
-#  matches.  Products matching no keyword are skipped.
 # ─────────────────────────────────────────────
 print("🗂️  Splitting products by parent category...", flush=True)
 
@@ -741,10 +760,7 @@ groups: list[tuple[str, list]] = []
 
 for label, keyword in SPLIT_GROUPS:
     pattern = re.compile(re.escape(keyword), re.IGNORECASE)
-    matched = [
-        p for p in all_products
-        if pattern.search(categ_path(p))
-    ]
+    matched = [p for p in all_products if pattern.search(categ_path(p))]
     if matched:
         groups.append((label, matched))
         print(f"   ↳ '{label}' → {len(matched)} product(s).", flush=True)
@@ -763,7 +779,6 @@ print(f"📤 Sending to {SMTP_TO}...", flush=True)
 
 for group_label, products in groups:
 
-    # Sort: sub-category (natural) → product name (natural) → qty
     products_sorted = sorted(
         products,
         key=lambda p: (
@@ -773,11 +788,14 @@ for group_label, products in groups:
         )
     )
 
-    total_products     = len(products_sorted)
-    out_count          = sum(1 for p in products_sorted if float(p.get(qty_field) or 0) == 0)
-    critical_count     = sum(1 for p in products_sorted if 0 < float(p.get(qty_field) or 0) <= 2)
-    low_count          = sum(1 for p in products_sorted if 3 <= float(p.get(qty_field) or 0) < LOW_STOCK_THRESHOLD)
+    total_products      = len(products_sorted)
+    out_count           = sum(1 for p in products_sorted if float(p.get(qty_field) or 0) == 0)
+    critical_count      = sum(1 for p in products_sorted if 0 < float(p.get(qty_field) or 0) <= 2)
+    low_count           = sum(1 for p in products_sorted if 3 <= float(p.get(qty_field) or 0) < LOW_STOCK_THRESHOLD)
     total_subcategories = len({subcateg_name(p) for p in products_sorted})
+
+    # Only attach images for products in THIS group — no cross-contamination
+    group_image_map = {p["id"]: product_img_map[p["id"]] for p in products_sorted}
 
     subject = (
         f"⚑ Low Stock · {group_label}"
@@ -787,19 +805,18 @@ for group_label, products in groups:
     )
 
     html = build_html(
-        products          = products_sorted,
-        qty_field         = qty_field,
-        product_data_uris = product_data_uris,
-        group_label       = group_label,
-        total_products    = total_products,
+        products            = products_sorted,
+        qty_field           = qty_field,
+        group_label         = group_label,
+        total_products      = total_products,
         total_subcategories = total_subcategories,
-        out_count         = out_count,
-        critical_count    = critical_count,
-        low_count         = low_count,
+        out_count           = out_count,
+        critical_count      = critical_count,
+        low_count           = low_count,
     )
 
     try:
-        send_email(html, subject)
+        send_email(html, subject, group_image_map)
         print(
             f"   ✅ '{group_label}' email sent  "
             f"({total_products:,} products  ·  {out_count:,} out  "
