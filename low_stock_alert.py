@@ -38,12 +38,8 @@ QTY_FIELD_CANDIDATES = [
 ]
 
 # ── Parent-category split ────────────────────
-# Products whose full category path contains "imported" (case-insensitive)
-# go into Email 1. Those containing "indian" go into Email 2.
-# Products matching neither are skipped (not emailed).
-# Adjust these strings to match your exact Odoo category names.
 SPLIT_GROUPS = [
-    ("Imported", "imported"),   # (email label,  keyword to match in categ path)
+    ("Imported", "imported"),
     ("Indian",   "indian"),
 ]
 
@@ -53,11 +49,10 @@ AVATAR_COLORS = [
     "#2c4a7c", "#1a3a5c", "#2d6a4f", "#1b4332",
 ]
 
-# 1×1 transparent PNG fallback (used when a product has no image)
-FALLBACK_B64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAA"
-    "DUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-)
+# Image display size — 44 → 66px (50% larger)
+IMG_SIZE = 66
+# Cell width: image + side padding (20 left + 6 right = 26, cell = IMG_SIZE + 26)
+IMG_CELL_WIDTH = IMG_SIZE + 26
 
 
 # ─────────────────────────────────────────────
@@ -73,25 +68,22 @@ def avatar_color(name: str) -> str:
 
 
 def letter_avatar_svg_bytes(name: str) -> bytes:
-    """
-    Return raw SVG bytes for a gold letter avatar.
-    Attached as a MIMEImage just like a real product image.
-    """
+    """Return raw SVG bytes for a gold letter avatar."""
     letter = (name or "?")[0].upper()
     color  = avatar_color(name)
     svg = (
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48">'
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{IMG_SIZE}" height="{IMG_SIZE}">'
         f'<defs>'
         f'<linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
         f'<stop offset="0%" stop-color="{color}"/>'
         f'<stop offset="100%" stop-color="#0a0a0f"/>'
         f'</linearGradient>'
         f'</defs>'
-        f'<rect width="48" height="48" rx="10" fill="url(#g)"/>'
-        f'<rect width="48" height="48" rx="10" fill="none" '
+        f'<rect width="{IMG_SIZE}" height="{IMG_SIZE}" rx="12" fill="url(#g)"/>'
+        f'<rect width="{IMG_SIZE}" height="{IMG_SIZE}" rx="12" fill="none" '
         f'stroke="#c9a84c" stroke-width="1" opacity="0.6"/>'
-        f'<text x="24" y="33" text-anchor="middle" '
-        f'font-family="Georgia,serif" font-size="22" '
+        f'<text x="{IMG_SIZE//2}" y="{int(IMG_SIZE*0.68)}" text-anchor="middle" '
+        f'font-family="Georgia,serif" font-size="{int(IMG_SIZE*0.45)}" '
         f'font-weight="700" fill="#e8c96d">{letter}</text>'
         f'</svg>'
     )
@@ -133,7 +125,6 @@ def stock_badge(qty: float) -> str:
 
 
 def natural_sort_key(s: str):
-    """Sort strings naturally: 'Item 2' before 'Item 10'."""
     return [
         int(c) if c.isdigit() else c.lower()
         for c in re.split(r'(\d+)', s or "")
@@ -145,16 +136,10 @@ def esc(s: str) -> str:
 
 
 def categ_path(p: dict) -> str:
-    """Return the full category path string, e.g. 'All / Imported / Sofas'."""
     return p["categ_id"][1] if p.get("categ_id") else ""
 
 
 def subcateg_name(p: dict) -> str:
-    """
-    Return the sub-category portion (last segment after the split keyword).
-    e.g. 'All / Imported / Living Room / Sofas'  →  'Living Room / Sofas'
-    Falls back to the full path if no split keyword found.
-    """
     full = categ_path(p)
     for _, kw in SPLIT_GROUPS:
         pattern = re.compile(re.escape(kw), re.IGNORECASE)
@@ -166,36 +151,26 @@ def subcateg_name(p: dict) -> str:
     return full
 
 
+def product_url(p: dict) -> str:
+    """Build a direct Odoo backend link to this product."""
+    return f"{ODOO_URL}/web#id={p['id']}&model=product.product&view_type=form"
+
+
 # ─────────────────────────────────────────────
 #  IMAGE DECODING
-#  Proven approach from the working test script:
-#  sanitise the base64 string then decode to raw bytes.
-#  xmlrpc.client.Binary objects are handled explicitly.
 # ─────────────────────────────────────────────
 def decode_image(raw_img) -> bytes | None:
-    """
-    Return raw image bytes from whatever xmlrpc.client gives us, or None.
-
-    Odoo XML-RPC can return image fields as:
-      • xmlrpc.client.Binary  →  .data holds raw bytes already
-      • str                   →  base64-encoded string
-      • bytes                 →  base64-encoded bytes (rare)
-      • False / None          →  no image
-    """
     try:
         if not raw_img or str(raw_img) == "False":
             return None
 
-        # Case 1: xmlrpc.client.Binary — .data is already raw bytes
         if isinstance(raw_img, xmlrpc.client.Binary):
             return raw_img.data
 
-        # Case 2: str — base64-encoded string (most common in practice)
         if isinstance(raw_img, str):
             cleaned = raw_img.replace("\n", "").replace("\r", "").strip()
             return base64.b64decode(cleaned)
 
-        # Case 3: bytes — base64-encoded bytes
         if isinstance(raw_img, bytes):
             cleaned = raw_img.replace(b"\n", b"").replace(b"\r", b"").strip()
             return base64.b64decode(cleaned)
@@ -207,16 +182,16 @@ def decode_image(raw_img) -> bytes | None:
 
 
 # ─────────────────────────────────────────────
-#  HTML BUILDER  —  100 % Gmail-safe, zero JS
+#  HTML BUILDER
 #
-#  Images referenced as  cid:product_<id>
-#  resolved by MIMEImage parts added in send_email().
-#
-#  Layout strategy:
-#    • 3 colour-coded stock-level bands: OUT → CRITICAL → LOW
-#    • Within each band: sub-categories sorted A-Z / 0-9
-#    • Within each sub-category: products sorted A-Z / 0-9 → qty asc
-#    • Pure luxury design: deep obsidian + gold dividers + serif accents
+#  Changes vs previous version:
+#    • IMG_SIZE = 66px (50% larger than 44px)
+#    • object-fit: contain + dark bg so no cropping
+#    • Images wrapped in <a href> → clickable to Odoo product page
+#    • Cell width is adaptive to IMG_SIZE constant
+#    • Tightened row/section/level padding (no wasted negative space)
+#    • CID references use canonical hash-based IDs to guarantee
+#      zero duplication in the MIME message
 # ─────────────────────────────────────────────
 def build_html(
     products: list,
@@ -227,11 +202,11 @@ def build_html(
     out_count: int,
     critical_count: int,
     low_count: int,
+    cid_map: dict,        # product_id → cid string (hash-based, shared across dupes)
 ) -> str:
 
     generated_at = utc_now().strftime("%d %b %Y  %H:%M UTC")
 
-    # ── Group: stock level → sub-category → [products] ──────────────────
     by_level: dict[str, dict[str, list]] = {
         "out":      defaultdict(list),
         "critical": defaultdict(list),
@@ -242,7 +217,6 @@ def build_html(
         sub = subcateg_name(p) or "General"
         by_level[stock_level(qty)][sub].append(p)
 
-    # ── Decorative gold divider line ─────────────────────────────────────
     GOLD_LINE = (
         '<tr><td colspan="3" style="padding:0;height:1px;font-size:1px;'
         'background:linear-gradient(90deg,transparent,#c9a84c33 30%,'
@@ -279,7 +253,7 @@ def build_html(
         # ── Level banner ─────────────────────────────────────────────────
         sections_html += f"""
         <tr>
-          <td colspan="3" style="padding:28px 20px 10px;">
+          <td colspan="3" style="padding:18px 20px 6px;">
             <table width="100%" cellpadding="0" cellspacing="0">
               <tr>
                 <td style="background:{bg_col};
@@ -288,7 +262,7 @@ def build_html(
                            border-left:3px solid {accent};
                            border-right:1px solid {border_col};
                            border-radius:0 8px 8px 0;
-                           padding:11px 20px;">
+                           padding:9px 16px;">
                   <table width="100%" cellpadding="0" cellspacing="0"><tr>
                     <td style="font-family:Georgia,'Times New Roman',serif;
                                font-size:11px;font-weight:700;color:{text_col};
@@ -308,7 +282,6 @@ def build_html(
           </td>
         </tr>"""
 
-        # Sort sub-categories naturally
         for sub_name in sorted(cats.keys(), key=natural_sort_key):
             cat_products = sorted(
                 cats[sub_name],
@@ -321,10 +294,10 @@ def build_html(
             # ── Sub-category header ───────────────────────────────────────
             sections_html += f"""
         <tr>
-          <td colspan="3" style="padding:10px 20px 3px;">
+          <td colspan="3" style="padding:6px 20px 2px;">
             <table width="100%" cellpadding="0" cellspacing="0">
               <tr>
-                <td style="border-bottom:1px solid #c9a84c22;padding-bottom:6px;">
+                <td style="border-bottom:1px solid #c9a84c22;padding-bottom:4px;">
                   <span style="font-family:Georgia,'Times New Roman',serif;
                                font-size:10px;font-weight:700;letter-spacing:2px;
                                text-transform:uppercase;color:#c9a84c;">
@@ -346,28 +319,35 @@ def build_html(
                 badge  = stock_badge(qty)
                 name   = esc(p["name"] or "—")
                 row_bg = "#08080f" if idx % 2 == 0 else "#060609"
-                cid    = f"product_{p['id']}"
+                cid    = cid_map[p["id"]]
+                url    = product_url(p)
 
+                # Contain (no crop) — dark bg fills letterbox gaps
                 img_tag = (
-                    f'<img src="cid:{cid}" width="44" height="44" '
-                    f'style="width:44px;height:44px;border-radius:8px;'
-                    f'object-fit:cover;display:block;border:1px solid #c9a84c22;" alt="">'
+                    f'<a href="{url}" target="_blank" '
+                    f'style="display:block;width:{IMG_SIZE}px;height:{IMG_SIZE}px;'
+                    f'border-radius:10px;overflow:hidden;border:1px solid #c9a84c22;'
+                    f'background:#0a0a12;text-decoration:none;">'
+                    f'<img src="cid:{cid}" width="{IMG_SIZE}" height="{IMG_SIZE}" '
+                    f'style="width:{IMG_SIZE}px;height:{IMG_SIZE}px;'
+                    f'object-fit:contain;display:block;" alt="">'
+                    f'</a>'
                 )
 
                 sections_html += f"""
         <tr style="background:{row_bg};">
-          <td width="64" style="padding:8px 6px 8px 20px;
+          <td width="{IMG_CELL_WIDTH}" style="padding:6px 6px 6px 20px;
                                 vertical-align:middle;text-align:left;">
             {img_tag}
           </td>
-          <td style="padding:8px 10px;
+          <td style="padding:6px 10px;
                      font-family:'Segoe UI',Helvetica,Arial,sans-serif;
                      font-size:13px;color:#d4c5a0;font-weight:500;
                      vertical-align:middle;word-break:break-word;
                      line-height:1.4;">
             {name}
           </td>
-          <td style="padding:8px 20px 8px 10px;text-align:right;
+          <td style="padding:6px 20px 6px 10px;text-align:right;
                      vertical-align:middle;white-space:nowrap;">
             {badge}
           </td>
@@ -530,15 +510,15 @@ def build_html(
                  border-top:1px solid #c9a84c22;">
         <table width="100%" cellpadding="0" cellspacing="0">
           <tr style="background:#030308;">
-            <th width="64" style="padding:10px 6px 10px 20px;text-align:left;
+            <th width="{IMG_CELL_WIDTH}" style="padding:8px 6px 8px 20px;text-align:left;
                 font-family:'Segoe UI',Helvetica,Arial,sans-serif;font-size:8px;
                 font-weight:700;letter-spacing:2.5px;text-transform:uppercase;
                 color:#3a3020;">IMG</th>
-            <th style="padding:10px 10px;text-align:left;
+            <th style="padding:8px 10px;text-align:left;
                 font-family:'Segoe UI',Helvetica,Arial,sans-serif;font-size:8px;
                 font-weight:700;letter-spacing:2.5px;text-transform:uppercase;
                 color:#3a3020;">Product Name</th>
-            <th style="padding:10px 20px 10px 10px;text-align:right;
+            <th style="padding:8px 20px 8px 10px;text-align:right;
                 font-family:'Segoe UI',Helvetica,Arial,sans-serif;font-size:8px;
                 font-weight:700;letter-spacing:2.5px;text-transform:uppercase;
                 color:#3a3020;">In Stock</th>
@@ -556,7 +536,7 @@ def build_html(
                  border-right:1px solid #c9a84c33;">
         <table width="100%" cellpadding="0" cellspacing="0">
           {sections_html}
-          <tr><td colspan="3" style="height:20px;"></td></tr>
+          <tr><td colspan="3" style="height:12px;"></td></tr>
         </table>
       </td>
     </tr>
@@ -577,7 +557,7 @@ def build_html(
 
         <table width="100%" cellpadding="0" cellspacing="0">
           <tr>
-            <td style="padding:16px 28px;
+            <td style="padding:14px 28px;
                        font-family:'Segoe UI',Helvetica,Arial,sans-serif;
                        font-size:10px;color:#2a2015;letter-spacing:0.5px;">
               Auto-generated · Inventory Alert System
@@ -585,7 +565,7 @@ def build_html(
               {label_upper}
             </td>
             <td align="right"
-                style="padding:16px 28px;
+                style="padding:14px 28px;
                        font-family:Georgia,'Times New Roman',serif;
                        font-size:10px;color:#2a2015;">
               {low_count:,}&nbsp;low
@@ -615,16 +595,21 @@ def build_html(
 
 # ─────────────────────────────────────────────
 #  SEND
-#  Structure (proven from working test script):
-#    multipart/related          ← ties HTML body to its inline images
-#    ├── multipart/alternative  ← best-practice HTML wrapper
+#
+#  Key upgrade: CID is based on the MD5 hash of the image bytes,
+#  NOT the product_id. This means identical images share ONE
+#  MIME part — zero duplication in the email payload.
+#
+#  Structure:
+#    multipart/related
+#    ├── multipart/alternative
 #    │   └── text/html
-#    └── image/png  cid:product_<id>   ← one part per product in this group
+#    └── image/*  cid:<md5hash>   ← one part per UNIQUE image only
 # ─────────────────────────────────────────────
 def send_email(
     html: str,
     subject: str,
-    image_map: dict,   # { product_id (int): raw bytes }
+    unique_images: dict,   # { md5_hash (str): raw bytes }
 ) -> None:
 
     msg_related = MIMEMultipart("related")
@@ -637,20 +622,19 @@ def send_email(
     msg_alt.attach(MIMEText(html, "html"))
     msg_related.attach(msg_alt)
 
-    # One inline image part per unique product_id in this group
-    for product_id, img_bytes in image_map.items():
+    # One inline image part per UNIQUE image hash — no duplicates
+    for img_hash, img_bytes in unique_images.items():
         try:
-            # SVG avatars vs PNG product images
             if img_bytes[:4] == b"<svg":
                 img_part = MIMEImage(img_bytes, _subtype="svg+xml")
             else:
-                img_part = MIMEImage(img_bytes, _subtype="png")
-            img_part.add_header("Content-ID",          f"<product_{product_id}>")
+                img_part = MIMEImage(img_bytes)
+            img_part.add_header("Content-ID",          f"<{img_hash}>")
             img_part.add_header("Content-Disposition", "inline",
-                                filename=f"product_{product_id}.png")
+                                filename=f"{img_hash}.img")
             msg_related.attach(img_part)
         except Exception as e:
-            print(f"   ⚠️  Could not attach image for product {product_id}: {e}", flush=True)
+            print(f"   ⚠️  Could not attach image {img_hash[:8]}…: {e}", flush=True)
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
         server.ehlo()
@@ -705,7 +689,6 @@ if all_products is None or qty_field is None:
     print("❌ None of the quantity fields worked. Aborting.", flush=True)
     sys.exit(1)
 
-# Safety filter — drop nulls / False that slipped through
 all_products = [
     p for p in all_products
     if p.get(qty_field) not in (None, False)
@@ -721,32 +704,39 @@ print(f"📦 Found {len(all_products)} low-stock product(s).", flush=True)
 
 # ─────────────────────────────────────────────
 #  3. DECODE IMAGES
-#  Build a map: product_id → raw bytes
-#  Identical image data is deduplicated by MD5 hash so the same
-#  bytes are never stored twice in memory, but every product_id
-#  still gets its own entry (needed for CID lookup in send_email).
+#
+#  hash_to_bytes  : md5 → canonical raw bytes  (dedup store)
+#  product_hash   : product_id → md5           (lookup for CID in HTML)
+#
+#  CID in HTML = md5 hash string  →  one MIME part per unique image.
 # ─────────────────────────────────────────────
 print("🖼️  Decoding product images...", flush=True)
 
-hash_to_bytes:   dict[str, bytes] = {}   # md5 → canonical raw bytes
-product_img_map: dict[int, bytes] = {}   # product_id → raw bytes
+hash_to_bytes: dict[str, bytes] = {}   # md5 → raw bytes
+product_hash:  dict[int, str]   = {}   # product_id → md5 (= CID)
 
 for p in all_products:
     p_id      = p["id"]
     img_bytes = decode_image(p.get("image_512"))
 
-    if img_bytes:
-        h = hashlib.md5(img_bytes).hexdigest()
-        if h not in hash_to_bytes:
-            hash_to_bytes[h] = img_bytes
-        product_img_map[p_id] = hash_to_bytes[h]
-    else:
-        # Letter-avatar SVG as fallback — unique per product name
-        product_img_map[p_id] = letter_avatar_svg_bytes(p["name"] or "?")
+    if not img_bytes:
+        # Letter-avatar: one per unique product name (avatars are cheap to dupe in bytes
+        # but we still dedup them via hash)
+        img_bytes = letter_avatar_svg_bytes(p["name"] or "?")
 
+    h = hashlib.md5(img_bytes).hexdigest()
+    if h not in hash_to_bytes:
+        hash_to_bytes[h] = img_bytes
+    product_hash[p_id] = h
+
+real_images = sum(
+    1 for p in all_products
+    if decode_image(p.get("image_512")) is not None
+)
 print(
     f"   ↳ {len(all_products)} products → "
-    f"{len(hash_to_bytes)} unique real image(s).",
+    f"{len(hash_to_bytes)} unique MIME image part(s) "
+    f"({real_images} real, {len(all_products)-real_images} avatar).",
     flush=True,
 )
 
@@ -794,8 +784,14 @@ for group_label, products in groups:
     low_count           = sum(1 for p in products_sorted if 3 <= float(p.get(qty_field) or 0) < LOW_STOCK_THRESHOLD)
     total_subcategories = len({subcateg_name(p) for p in products_sorted})
 
-    # Only attach images for products in THIS group — no cross-contamination
-    group_image_map = {p["id"]: product_img_map[p["id"]] for p in products_sorted}
+    # cid_map: product_id → hash string used as CID in both HTML and MIME parts
+    group_cid_map = {p["id"]: product_hash[p["id"]] for p in products_sorted}
+
+    # Only attach unique images referenced by THIS group's products
+    group_unique_images = {
+        h: hash_to_bytes[h]
+        for h in set(group_cid_map.values())
+    }
 
     subject = (
         f"⚑ Low Stock · {group_label}"
@@ -813,14 +809,16 @@ for group_label, products in groups:
         out_count           = out_count,
         critical_count      = critical_count,
         low_count           = low_count,
+        cid_map             = group_cid_map,
     )
 
     try:
-        send_email(html, subject, group_image_map)
+        send_email(html, subject, group_unique_images)
         print(
             f"   ✅ '{group_label}' email sent  "
             f"({total_products:,} products  ·  {out_count:,} out  "
-            f"·  {critical_count:,} critical  ·  {low_count:,} low).",
+            f"·  {critical_count:,} critical  ·  {low_count:,} low  "
+            f"·  {len(group_unique_images)} unique image part(s)).",
             flush=True,
         )
     except Exception as exc:
