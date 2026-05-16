@@ -4,8 +4,9 @@ import smtplib
 import os
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
 
-print("Minimal image test – using direct Odoo image URL")
+print("CID attachment image test")
 
 ODOO_URL = os.environ.get("ODOO_URL")
 ODOO_DB = os.environ.get("ODOO_DB")
@@ -26,40 +27,52 @@ if not uid:
     raise Exception("Odoo auth failed")
 models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-# Find product CH-625
+# Find product
 pids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'search',
     [[['name', 'ilike', 'CH-625']]], {'limit': 1})
 if not pids:
     print("Product not found")
     exit(1)
 pid = pids[0]
-print(f"Product ID: {pid}")
 
-# Build image URL (direct, not base64)
-image_url = f"{ODOO_URL}/web/image/product.product/{pid}/image_128"
+# Fetch image
+url = f"{ODOO_URL}/web/image/product.product/{pid}/image_128"
+session = requests.Session()
+session.auth = (ODOO_USER, ODOO_PASSWORD)
+resp = session.get(url, timeout=10)
+if resp.status_code != 200 or len(resp.content) < 100:
+    print("Image not fetched")
+    exit(1)
 
-# Simple HTML with direct image URL
-html = f"""
+# Create email with attachment
+msg = MIMEMultipart("related")  # "related" allows referencing attachments
+msg["Subject"] = "CH-625 Image (CID attachment)"
+msg["From"] = SMTP_FROM
+msg["To"] = SMTP_TO
+
+# HTML that references the image by CID
+html = """
 <html>
 <body>
 <h2>CH-625 Dining Chair</h2>
-<img src="{image_url}" width="200" />
-<p>If you see the image above (maybe after clicking "Load images"), the direct URL works.</p>
+<img src="cid:product_image" width="200">
+<p>This image is attached as a CID (works in all email clients).</p>
 </body>
 </html>
 """
+html_part = MIMEText(html, "html")
+msg.attach(html_part)
 
-# Send email
-msg = MIMEMultipart("alternative")
-msg["Subject"] = "Minimal image test – direct URL"
-msg["From"] = SMTP_FROM
-msg["To"] = SMTP_TO
-msg.attach(MIMEText(html, "html"))
+# Attach the image with a Content-ID
+image_part = MIMEImage(resp.content, _subtype="png")   # or "jpeg"
+image_part.add_header("Content-ID", "<product_image>")
+image_part.add_header("Content-Disposition", "inline", filename="product.png")
+msg.attach(image_part)
 
-print(f"Connecting to SMTP {SMTP_HOST}:{SMTP_PORT}...")
+# Send
 with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
     server.starttls()
     server.login(SMTP_USER, SMTP_PASSWORD)
     server.send_message(msg)
 
-print("Email sent. Check inbox.")
+print("Email sent with CID attachment – image should appear.")
