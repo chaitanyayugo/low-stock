@@ -86,11 +86,17 @@ for idx, pid in enumerate(product_ids, start=1):
         print(f"   Progress: {idx}/{total_products} product images downloaded", flush=True)
 print("✅ All images downloaded", flush=True)
 
-# ---------- 5. BUILD EMAIL HTML ----------
+# ---------- 5. BUILD EMAIL HTML (ONLY 2 PRODUCTS) ----------
 print("📧 Building email HTML...", flush=True)
 rows = ""
+products_shown = 0
 for q in quants:
     product_id = q["product_id"][0]
+    if product_id not in product_image_map:
+        continue  # skip products not in our 2‑product list
+    if products_shown >= 2:
+        continue  # only 2 rows
+
     product_name = q["product_id"][1]
     location_name = q["location_id"][1] if q["location_id"] else "Unknown"
     quantity = q["quantity"]
@@ -117,6 +123,7 @@ for q in quants:
         </td>
     </tr>
     """
+    products_shown += 1
 
 full_html = f"""
 <div style="background:#f9fafb; padding:40px 10px; font-family:Helvetica;">
