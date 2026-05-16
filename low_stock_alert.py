@@ -21,7 +21,6 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM = os.environ.get("SMTP_FROM")
 SMTP_TO = os.environ.get("SMTP_TO")
 
-# Define our threshold logic clearly
 LOW_STOCK_THRESHOLD = 5
 
 # ---------- 1. CONNECT TO ODOO ----------
@@ -49,27 +48,25 @@ quants = models.execute_kw(
     "search_read",
     [domain],
     {
-        "fields": ["id", "product_id", "location_id", "quantity", "reserved_quantity"],
+        # REMOVED reserved_quantity HERE
+        "fields": ["id", "product_id", "location_id", "quantity"], 
         "limit": 1  # 🔴 THIS TELLS ODOO TO ONLY GIVE BACK 1 RESULT
     }
 )
 
-# Second failsafe: Cut the list down to 1 manually just in case
-quants = quants[:1]
+quants = quants[:1] # Double enforce limit locally
 
 if not quants:
     print("✅ No low-stock products found. Exiting gracefully.", flush=True)
     sys.exit(0)
 
-# Build a unique set of product IDs
 product_ids = list({q["product_id"][0] for q in quants if q["product_id"]})
 total_products = len(product_ids)
 print(f"📦 Found {len(quants)} low-stock record. Will process {total_products} unique product.", flush=True)
 
-# ---------- 3. BULK FETCH IMAGE VIA XML-RPC ----------
+# ---------- 3. BULK FETCH IMAGE VIA XML-RPC (CRASH-PROOFED) ----------
 print("🖼️ Fetching product image...", flush=True)
 
-# Doing this via XML-RPC avoids all login redirect/cookie issues.
 product_data = models.execute_kw(
     ODOO_DB,
     uid,
@@ -81,19 +78,32 @@ product_data = models.execute_kw(
 )
 
 product_image_map = {}
+# Base64 fallback (a transparent 1x1 pixel) so the HTML tag always renders properly
 fallback_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 
 for p in product_data:
     p_id = p["id"]
-    img_b64 = p.get("image_128") or fallback_b64
-    
-    # Clean byte formatting depending on Odoo python versions
-    if isinstance(img_b64, bytes):
-        img_b64 = img_b64.decode("utf-8")
+    try:
+        raw_img = p.get("image_128")
+        if raw_img:
+            # Handle Py3 bytes conversion or string conversion depending on Odoo python environments
+            if isinstance(raw_img, bytes):
+                img_str = raw_img.decode("utf-8")
+            else:
+                img_str = str(raw_img)
+            
+            # Make sure it isn't boolean 'False' masquerading as text
+            if img_str == 'False' or not img_str:
+                img_str = fallback_b64
+        else:
+            img_str = fallback_b64
+    except Exception as e:
+        print(f"⚠️ Safe fail! Image read issue on Product ID {p_id}. Details: {e}")
+        img_str = fallback_b64 # Use invisible box so the layout doesn't tear
         
-    product_image_map[p_id] = f"data:image/png;base64,{img_b64}"
+    product_image_map[p_id] = f"data:image/png;base64,{img_str}"
 
-print("✅ Image securely retrieved", flush=True)
+print("✅ Image processed safely", flush=True)
 
 # ---------- 4. BUILD EMAIL HTML ----------
 print("📧 Building email HTML...", flush=True)
@@ -103,16 +113,16 @@ for q in quants:
     product_name = q["product_id"][1]
     location_name = q["location_id"][1] if q["location_id"] else "Unknown"
     
-    # Cast quantities nicely without floating zeros (.0)
+    # Cast to int visually where `.0` floats usually hang on Odoo values
     quantity_fmt = f"{float(q['quantity']):g}" 
-    reserved_fmt = f"{float(q['reserved_quantity']):g}" 
 
     img_src = product_image_map.get(product_id, f"data:image/png;base64,{fallback_b64}")
 
+    # REMOVED RESERVED COLUMN IN ROW DATA
     rows += f"""
     <tr style="border-bottom:1px solid #eee;">
         <td style="padding:12px 15px; text-align:center;">
-            <img src="{img_src}" style="width:40px; height:40px; object-fit:cover; border-radius:6px;" alt="Product Image">
+            <img src="{img_src}" style="width:40px; height:40px; object-fit:cover; border-radius:6px;" alt="IMG">
         </td>
         <td style="padding:12px 15px; font-family:Helvetica; font-size:14px; font-weight:500;">
             {product_name}
@@ -127,9 +137,6 @@ for q in quants:
                 {quantity_fmt}
             </span>
         </td>
-        <td style="padding:12px 15px; text-align:center; color:#999; font-family:Helvetica; font-size:14px;">
-            {reserved_fmt}
-        </td>
     </tr>
     """
 
@@ -137,7 +144,7 @@ full_html = f"""
 <div style="background:#f9fafb; padding:40px 10px; font-family:Helvetica, sans-serif;">
   <div style="max-width:800px; margin:0 auto; background:#fff; border-radius:8px; border:1px solid #e5e7eb;">
     <div style="background:#111827; padding:25px 30px;">
-      <h1 style="color:#fff; margin:0; font-size: 20px;">⚠️ TEST REPORT - Inventory Alert: Low Stock Report</h1>
+      <h1 style="color:#fff; margin:0; font-size: 20px;">⚠️ TEST REPORT - Inventory Alert: Low Stock</h1>
       <p style="color:#9ca3af; font-size:14px;">The following items are below threshold of {LOW_STOCK_THRESHOLD} units</p>
     </div>
     <table style="width:100%; border-collapse:collapse; margin-bottom: 20px;">
@@ -147,7 +154,7 @@ full_html = f"""
           <th style="padding:15px; text-align:left;">Product Name</th>
           <th style="padding:15px; text-align:left;">Location</th>
           <th style="padding:15px; text-align:center;">In Stock</th>
-          <th style="padding:15px; text-align:center;">Reserved</th>
+          <!-- REMOVED RESERVED HEADER HERE -->
         </tr>
       </thead>
       <tbody>
@@ -173,7 +180,6 @@ msg.attach(MIMEText(full_html, "html"))
 
 try:
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-        # Ehlo establishes a valid connection sequence before establishing starttls.
         server.ehlo()
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
