@@ -37,7 +37,7 @@ QTY_FIELD_CANDIDATES = [
 
 # Field that marks a product as imported (boolean True/False in Odoo)
 # Adjust this to your actual custom field name
-IMPORTED_FIELD = "x_is_imported"   # ← set to None to disable split
+IMPORTED_FIELD = None   # set to e.g. "x_is_imported" to send two separate emails
 
 # Deterministic colour palette — used when a product has NO image in Odoo
 AVATAR_COLORS = [
@@ -515,7 +515,7 @@ all_products = None
 qty_field    = None
 
 # Decide which extra fields to pull
-extra_fields = ["id", "name", "categ_id", "image_128"]
+extra_fields = ["id", "name", "categ_id", "image_512"]
 if IMPORTED_FIELD:
     extra_fields.append(IMPORTED_FIELD)
 
@@ -578,7 +578,7 @@ product_data_uris: dict[int, str]     = {}
 
 for p in all_products:
     p_id    = p["id"]
-    raw_img = p.get("image_128")
+    raw_img = p.get("image_512")
     try:
         if raw_img and str(raw_img) != "False":
             img_str   = raw_img.decode("utf-8") if isinstance(raw_img, bytes) else str(raw_img)
