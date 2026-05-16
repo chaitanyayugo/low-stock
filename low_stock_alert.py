@@ -28,7 +28,10 @@ SMTP_FROM     = os.environ.get("SMTP_FROM")
 SMTP_TO       = os.environ.get("SMTP_TO")
 
 LOW_STOCK_THRESHOLD = 5
-MAX_CID_ATTACHMENTS = 490           # Gmail hard-caps at 500; stay safely under
+
+# Gmail hard-caps at 500 attachments per email.
+# We stay at 450 to leave a safe buffer.
+MAX_IMAGES_PER_EMAIL = 450
 
 # Quantity fields to try in priority order
 QTY_FIELD_CANDIDATES = [
@@ -37,13 +40,13 @@ QTY_FIELD_CANDIDATES = [
     "qty_available",
 ]
 
-# 1×1 transparent PNG fallback
+# 1×1 transparent PNG fallback (for products with no image in Odoo)
 FALLBACK_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAA"
     "DUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 )
 
-# Deterministic colour palette for letter-avatars
+# Deterministic colour palette — only used when a product has NO image in Odoo
 AVATAR_COLORS = [
     "#1d4ed8", "#0369a1", "#047857", "#7c3aed",
     "#b45309", "#be123c", "#0e7490", "#15803d",
@@ -63,6 +66,7 @@ def avatar_color(name: str) -> str:
 
 
 def letter_avatar_html(name: str) -> str:
+    """Coloured initial — only used when a product genuinely has no image in Odoo."""
     letter = (name or "?")[0].upper()
     color  = avatar_color(name)
     return (
@@ -77,20 +81,255 @@ def letter_avatar_html(name: str) -> str:
 def stock_badge(qty: float) -> str:
     if qty == 0:
         return (
-            '<span style="background:#1a0005; color:#ff4d6d; padding:4px 12px; '
-            'border-radius:20px; font-weight:700; font-size:13px; '
+            '<span style="background:#1a0005;color:#ff4d6d;padding:4px 12px;'
+            'border-radius:20px;font-weight:700;font-size:13px;'
             'letter-spacing:0.5px;">OUT</span>'
         )
     elif qty <= 2:
         return (
-            f'<span style="background:#1c0a00; color:#ff8c42; padding:4px 12px; '
-            f'border-radius:20px; font-weight:700; font-size:13px;">{qty:g}</span>'
+            f'<span style="background:#1c0a00;color:#ff8c42;padding:4px 12px;'
+            f'border-radius:20px;font-weight:700;font-size:13px;">{qty:g}</span>'
         )
     else:
         return (
-            f'<span style="background:#0a1a10; color:#52c41a; padding:4px 12px; '
-            f'border-radius:20px; font-weight:700; font-size:13px;">{qty:g}</span>'
+            f'<span style="background:#0a1a10;color:#52c41a;padding:4px 12px;'
+            f'border-radius:20px;font-weight:700;font-size:13px;">{qty:g}</span>'
         )
+
+
+def build_html(batch: list, qty_field: str, product_hash_map: dict,
+               part_label: str, total_products: int,
+               total_categories: int, critical_count: int, low_count: int) -> str:
+    """Build the full HTML email for one batch of products."""
+
+    generated_at = utc_now().strftime("%d %b %Y • %H:%M UTC")
+
+    # Group this batch by category
+    categories: dict[str, list] = defaultdict(list)
+    for p in batch:
+        cat_name = p["categ_id"][1] if p.get("categ_id") else "Uncategorised"
+        categories[cat_name].append(p)
+
+    sections_html = ""
+    for cat_name, cat_products in categories.items():
+        rows_html = ""
+        for p in cat_products:
+            p_id  = p["id"]
+            qty   = float(p.get(qty_field) or 0)
+            badge = stock_badge(qty)
+
+            img_hash = product_hash_map.get(p_id)
+            if img_hash:
+                img_cell = (
+                    f'<div style="width:44px;height:44px;border-radius:10px;'
+                    f'overflow:hidden;background:#1e2433;display:inline-block;">'
+                    f'<img src="cid:img_{img_hash}" width="44" height="44" '
+                    f'style="width:44px;height:44px;object-fit:cover;display:block;" alt="">'
+                    f'</div>'
+                )
+            else:
+                # This product genuinely has no image stored in Odoo
+                img_cell = letter_avatar_html(p["name"] or "?")
+
+            rows_html += f"""
+            <tr>
+              <td style="padding:12px 16px;width:56px;text-align:center;vertical-align:middle;">
+                {img_cell}
+              </td>
+              <td style="padding:12px 8px;font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                         font-size:14px;color:#e2e8f0;font-weight:500;vertical-align:middle;">
+                {p['name']}
+              </td>
+              <td style="padding:12px 16px;text-align:center;vertical-align:middle;">
+                {badge}
+              </td>
+            </tr>
+            <tr>
+              <td colspan="3" style="padding:0;height:1px;
+                  background:linear-gradient(90deg,transparent,
+                  #2d3748 20%,#2d3748 80%,transparent);"></td>
+            </tr>"""
+
+        sections_html += f"""
+        <tr>
+          <td colspan="3" style="padding:24px 20px 8px;">
+            <div style="display:inline-block;background:#0f172a;border:1px solid #334155;
+                        border-radius:6px;padding:4px 14px;">
+              <span style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                           font-size:11px;font-weight:700;letter-spacing:1.5px;
+                           text-transform:uppercase;color:#94a3b8;">{cat_name}</span>
+              <span style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                           font-size:11px;color:#475569;margin-left:8px;">
+                {len(cat_products)} item{'s' if len(cat_products) != 1 else ''}
+              </span>
+            </div>
+          </td>
+        </tr>
+        {rows_html}"""
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>Low Stock Alert</title>
+</head>
+<body style="margin:0;padding:0;background:#060b14;">
+<table width="100%" cellpadding="0" cellspacing="0"
+       style="background:#060b14;padding:32px 12px;">
+  <tr><td align="center">
+  <table width="640" cellpadding="0" cellspacing="0" style="max-width:640px;width:100%;">
+
+    <!-- HEADER -->
+    <tr>
+      <td style="background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);
+                 border-radius:16px 16px 0 0;border:1px solid #1e3a5f;
+                 padding:36px 32px 28px;">
+        <table width="100%" cellpadding="0" cellspacing="0"><tr>
+          <td>
+            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                        font-size:11px;font-weight:700;letter-spacing:3px;
+                        text-transform:uppercase;color:#38bdf8;margin-bottom:10px;">
+              ◈ &nbsp;INVENTORY MANAGEMENT SYSTEM
+            </div>
+            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                        font-size:26px;font-weight:700;color:#f1f5f9;
+                        line-height:1.2;margin-bottom:6px;">
+              Low Stock Alert &nbsp;
+              <span style="font-size:16px;color:#475569;font-weight:400;">
+                {part_label}
+              </span>
+            </div>
+            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                        font-size:13px;color:#64748b;">
+              {generated_at}
+              &nbsp;·&nbsp; Threshold: &lt;&nbsp;{LOW_STOCK_THRESHOLD} units
+              &nbsp;·&nbsp; Field:
+              <code style="color:#94a3b8;font-size:12px;">{qty_field}</code>
+            </div>
+          </td>
+          <td align="right" valign="top">
+            <div style="background:#ff4d6d22;border:1px solid #ff4d6d55;
+                        border-radius:50%;width:52px;height:52px;
+                        text-align:center;line-height:52px;font-size:24px;">⚠</div>
+          </td>
+        </tr></table>
+      </td>
+    </tr>
+
+    <!-- METRICS STRIP -->
+    <tr>
+      <td style="background:#0d1929;border-left:1px solid #1e3a5f;
+                 border-right:1px solid #1e3a5f;">
+        <table width="100%" cellpadding="0" cellspacing="0"><tr>
+          <td width="33%" style="padding:20px 0;text-align:center;
+                                  border-right:1px solid #1e293b;">
+            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                        font-size:30px;font-weight:800;color:#f1f5f9;line-height:1;">
+              {total_products}</div>
+            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                        font-size:11px;color:#475569;margin-top:4px;
+                        text-transform:uppercase;letter-spacing:1px;">Total Products</div>
+          </td>
+          <td width="33%" style="padding:20px 0;text-align:center;
+                                  border-right:1px solid #1e293b;">
+            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                        font-size:30px;font-weight:800;color:#f1f5f9;line-height:1;">
+              {total_categories}</div>
+            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                        font-size:11px;color:#475569;margin-top:4px;
+                        text-transform:uppercase;letter-spacing:1px;">Categories</div>
+          </td>
+          <td width="34%" style="padding:20px 0;text-align:center;">
+            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                        font-size:30px;font-weight:800;color:#ff4d6d;line-height:1;">
+              {critical_count}</div>
+            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                        font-size:11px;color:#475569;margin-top:4px;
+                        text-transform:uppercase;letter-spacing:1px;">Out of Stock</div>
+          </td>
+        </tr></table>
+      </td>
+    </tr>
+
+    <!-- PRODUCT TABLE -->
+    <tr>
+      <td style="background:#0a1628;border-left:1px solid #1e3a5f;
+                 border-right:1px solid #1e3a5f;border-top:1px solid #1e293b;">
+        <table width="100%" cellpadding="0" cellspacing="0">
+          <tr style="background:#080f1e;">
+            <th width="56" style="padding:12px 16px;text-align:center;
+                font-family:'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;
+                font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
+                color:#334155;">IMG</th>
+            <th style="padding:12px 8px;text-align:left;
+                font-family:'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;
+                font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
+                color:#334155;">Product</th>
+            <th width="110" style="padding:12px 16px;text-align:center;
+                font-family:'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;
+                font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
+                color:#334155;">In Stock</th>
+          </tr>
+          {sections_html}
+        </table>
+      </td>
+    </tr>
+
+    <!-- FOOTER -->
+    <tr>
+      <td style="background:#080f1e;border:1px solid #1e3a5f;
+                 border-top:1px solid #1e293b;border-radius:0 0 16px 16px;
+                 padding:20px 32px;">
+        <table width="100%" cellpadding="0" cellspacing="0"><tr>
+          <td style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                     font-size:11px;color:#334155;">
+            Auto-generated by Inventory Alert System
+          </td>
+          <td align="right"
+              style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                     font-size:11px;color:#334155;">
+            {low_count} low &nbsp;·&nbsp;
+            <span style="color:#ff4d6d;">{critical_count} out</span>
+          </td>
+        </tr></table>
+      </td>
+    </tr>
+
+  </table>
+  </td></tr>
+</table>
+</body>
+</html>"""
+
+
+def send_email(html: str, batch_images: dict[str, bytes],
+               subject: str) -> None:
+    """Assemble and send one email with its CID image attachments."""
+    msg = MIMEMultipart("related")
+    msg["Subject"] = subject
+    msg["From"]    = SMTP_FROM
+    msg["To"]      = SMTP_TO
+
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(html, "html"))
+    msg.attach(alt)
+
+    for img_hash, img_bytes in batch_images.items():
+        try:
+            part = MIMEImage(img_bytes, _subtype="png")
+            part.add_header("Content-ID",          f"<img_{img_hash}>")
+            part.add_header("Content-Disposition", "inline",
+                            filename=f"img_{img_hash}.png")
+            msg.attach(part)
+        except Exception as exc:
+            print(f"   ⚠️  Could not attach image {img_hash}: {exc}", flush=True)
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.send_message(msg)
 
 
 # ─────────────────────────────────────────────
@@ -107,7 +346,7 @@ print("✅ Connected to Odoo", flush=True)
 
 
 # ─────────────────────────────────────────────
-#  2. AUTO-DETECT QUANTITY FIELD & FETCH PRODUCTS
+#  2. AUTO-DETECT QUANTITY FIELD & FETCH ALL PRODUCTS
 # ─────────────────────────────────────────────
 print("🔍 Detecting available quantity field...", flush=True)
 
@@ -127,7 +366,7 @@ for candidate in QTY_FIELD_CANDIDATES:
             ]],
             {
                 "fields": ["id", "name", "categ_id", "image_128", candidate],
-                "limit":  0,
+                "limit":  0,        # fetch ALL matching records
             },
         )
         products  = result
@@ -141,7 +380,7 @@ if products is None or qty_field is None:
     print("❌ None of the quantity fields worked. Aborting.", flush=True)
     sys.exit(1)
 
-# Safety filter: drop nulls / False values that slipped through
+# Safety filter — drop nulls / False that slipped through
 products = [
     p for p in products
     if p.get(qty_field) not in (None, False)
@@ -166,318 +405,124 @@ products.sort(key=lambda p: (
 
 
 # ─────────────────────────────────────────────
-#  4. DEDUPLICATE IMAGES  (no extra API call)
-#
-#  image_128 was already fetched inside search_read (Step 2).
-#  We read it straight from the `products` list already in memory.
-#
-#    • Hash every image (MD5)
-#    • Store only UNIQUE images  →  hash_to_bytes
-#    • Map product_id → hash    →  product_hash_map
-#    • HTML uses  cid:img_<hash>  so N products sharing one image = 1 attachment
-#
-#  If unique images still exceed MAX_CID_ATTACHMENTS we switch to
-#  letter-avatars (zero attachments) to stay inside Gmail's hard limit.
+#  4. DECODE & DEDUPLICATE IMAGES
+#     image_128 is already in the search_read payload — zero extra API calls.
+#     hash_to_bytes  : img_hash → raw PNG bytes  (unique images only)
+#     product_hash_map: p_id    → img_hash | None
 # ─────────────────────────────────────────────
-print("🖼️  Deduplicating product images (no extra API call)...", flush=True)
+print("🖼️  Deduplicating product images...", flush=True)
 
-hash_to_bytes:    dict[str, bytes]      = {}   # img_hash  → raw PNG bytes
-product_hash_map: dict[int, str | None] = {}   # p_id      → img_hash | None
+hash_to_bytes:    dict[str, bytes]      = {}
+product_hash_map: dict[int, str | None] = {}
 
-for item in products:
-    p_id    = item["id"]
-    raw_img = item.get("image_128")
+for p in products:
+    p_id    = p["id"]
+    raw_img = p.get("image_128")
     try:
         if raw_img and str(raw_img) != "False":
             img_str   = raw_img.decode("utf-8") if isinstance(raw_img, bytes) else str(raw_img)
             img_str   = img_str.replace("\n", "").replace("\r", "").strip()
             img_bytes = base64.b64decode(img_str)
             img_hash  = hashlib.md5(img_bytes).hexdigest()
-            hash_to_bytes[img_hash]   = img_bytes
-            product_hash_map[p_id]    = img_hash
+            hash_to_bytes[img_hash]  = img_bytes
+            product_hash_map[p_id]   = img_hash
         else:
-            product_hash_map[p_id] = None
+            product_hash_map[p_id] = None      # no image in Odoo → letter avatar
     except Exception as exc:
         print(f"   ⚠️  Bad image for product {p_id}: {exc}", flush=True)
         product_hash_map[p_id] = None
 
-unique_count = len(hash_to_bytes)
+unique_total = len(hash_to_bytes)
 print(
-    f"   ↳ {len(products)} products → {unique_count} unique image(s) after deduplication.",
+    f"   ↳ {len(products)} products → {unique_total} unique image(s).",
     flush=True,
 )
 
-if unique_count <= MAX_CID_ATTACHMENTS:
-    use_cid = True
-    print("   ↳ Mode: CID inline attachments ✅", flush=True)
-else:
-    use_cid = False
-    print(
-        f"   ↳ {unique_count} unique images exceeds the {MAX_CID_ATTACHMENTS}-attachment limit.\n"
-        f"   ↳ Mode: letter-avatar fallback (no image attachments) ✅",
-        flush=True,
-    )
-
-print("✅ Images ready.", flush=True)
-
 
 # ─────────────────────────────────────────────
-#  5. BUILD ELITE EMAIL HTML  (grouped by category)
+#  5. SMART-BATCH  (image-count aware)
+#
+#  Walk through the sorted product list and keep filling the current batch.
+#  The moment adding a new product's image would push unique images over
+#  MAX_IMAGES_PER_EMAIL, seal the current batch and open a new one.
+#  This guarantees every email stays within Gmail's 500-attachment limit
+#  while keeping categories together as much as possible.
 # ─────────────────────────────────────────────
-print("📧 Building elite email HTML...", flush=True)
+batches:        list[list]           = []
+batch_img_sets: list[dict[str, bytes]] = []
 
+cur_batch:  list  = []
+cur_hashes: dict[str, bytes] = {}
+
+for p in products:
+    img_hash = product_hash_map.get(p["id"])
+
+    # Would this image push us over the limit?
+    if img_hash and img_hash not in cur_hashes and len(cur_hashes) >= MAX_IMAGES_PER_EMAIL:
+        # Seal current batch
+        batches.append(cur_batch)
+        batch_img_sets.append(cur_hashes)
+        cur_batch  = []
+        cur_hashes = {}
+
+    cur_batch.append(p)
+    if img_hash:
+        cur_hashes[img_hash] = hash_to_bytes[img_hash]
+
+# Seal the final batch
+if cur_batch:
+    batches.append(cur_batch)
+    batch_img_sets.append(cur_hashes)
+
+total_batches    = len(batches)
 total_products   = len(products)
 total_categories = len({p["categ_id"][0] for p in products if p.get("categ_id")})
 critical_count   = sum(1 for p in products if float(p.get(qty_field) or 0) == 0)
 low_count        = total_products - critical_count
-generated_at     = utc_now().strftime("%d %b %Y • %H:%M UTC")
 
-# Group by category
-categories: dict[str, list] = defaultdict(list)
-for p in products:
-    cat_name = p["categ_id"][1] if p.get("categ_id") else "Uncategorised"
-    categories[cat_name].append(p)
-
-# Build category sections
-sections_html = ""
-for cat_name, cat_products in categories.items():
-    rows_html = ""
-    for p in cat_products:
-        p_id  = p["id"]
-        qty   = float(p.get(qty_field) or 0)
-        badge = stock_badge(qty)
-
-        # Image cell
-        if use_cid:
-            img_hash = product_hash_map.get(p_id)
-            if img_hash:
-                img_cell = (
-                    f'<div style="width:44px; height:44px; border-radius:10px; '
-                    f'overflow:hidden; background:#1e2433; display:inline-block;">'
-                    f'<img src="cid:img_{img_hash}" width="44" height="44" '
-                    f'style="width:44px;height:44px;object-fit:cover;display:block;" alt="">'
-                    f'</div>'
-                )
-            else:
-                img_cell = letter_avatar_html(p["name"] or "?")
-        else:
-            img_cell = letter_avatar_html(p["name"] or "?")
-
-        rows_html += f"""
-        <tr>
-          <td style="padding:12px 16px; width:56px; text-align:center; vertical-align:middle;">
-            {img_cell}
-          </td>
-          <td style="padding:12px 8px;
-                     font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                     font-size:14px; color:#e2e8f0; font-weight:500;
-                     vertical-align:middle;">
-            {p['name']}
-          </td>
-          <td style="padding:12px 16px; text-align:center; vertical-align:middle;">
-            {badge}
-          </td>
-        </tr>
-        <tr>
-          <td colspan="3" style="padding:0; height:1px;
-              background:linear-gradient(90deg, transparent,
-              #2d3748 20%, #2d3748 80%, transparent);"></td>
-        </tr>
-        """
-
-    sections_html += f"""
-    <tr>
-      <td colspan="3" style="padding:24px 20px 8px;">
-        <div style="display:inline-block; background:#0f172a;
-                    border:1px solid #334155; border-radius:6px; padding:4px 14px;">
-          <span style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                       font-size:11px; font-weight:700; letter-spacing:1.5px;
-                       text-transform:uppercase; color:#94a3b8;">{cat_name}</span>
-          <span style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                       font-size:11px; color:#475569; margin-left:8px;">
-            {len(cat_products)} item{'s' if len(cat_products) != 1 else ''}
-          </span>
-        </div>
-      </td>
-    </tr>
-    {rows_html}
-    """
-
-full_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Low Stock Alert</title>
-</head>
-<body style="margin:0; padding:0; background:#060b14;">
-
-<table width="100%" cellpadding="0" cellspacing="0"
-       style="background:#060b14; padding:32px 12px;">
-  <tr><td align="center">
-  <table width="640" cellpadding="0" cellspacing="0" style="max-width:640px; width:100%;">
-
-    <!-- ══ HEADER ══ -->
-    <tr>
-      <td style="background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);
-                 border-radius:16px 16px 0 0; border:1px solid #1e3a5f;
-                 padding:36px 32px 28px;">
-        <table width="100%" cellpadding="0" cellspacing="0"><tr>
-          <td>
-            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:11px; font-weight:700; letter-spacing:3px;
-                        text-transform:uppercase; color:#38bdf8; margin-bottom:10px;">
-              ◈ &nbsp;INVENTORY MANAGEMENT SYSTEM
-            </div>
-            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:26px; font-weight:700; color:#f1f5f9;
-                        line-height:1.2; margin-bottom:6px;">
-              Low Stock Alert
-            </div>
-            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:13px; color:#64748b;">
-              {generated_at}
-              &nbsp;·&nbsp; Threshold: &lt;&nbsp;{LOW_STOCK_THRESHOLD} units
-              &nbsp;·&nbsp; Field:
-              <code style="color:#94a3b8; font-size:12px;">{qty_field}</code>
-            </div>
-          </td>
-          <td align="right" valign="top">
-            <div style="background:#ff4d6d22; border:1px solid #ff4d6d55;
-                        border-radius:50%; width:52px; height:52px;
-                        text-align:center; line-height:52px; font-size:24px;">⚠</div>
-          </td>
-        </tr></table>
-      </td>
-    </tr>
-
-    <!-- ══ METRICS STRIP ══ -->
-    <tr>
-      <td style="background:#0d1929; border-left:1px solid #1e3a5f;
-                 border-right:1px solid #1e3a5f;">
-        <table width="100%" cellpadding="0" cellspacing="0"><tr>
-          <td width="33%" style="padding:20px 0; text-align:center;
-                                  border-right:1px solid #1e293b;">
-            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:30px; font-weight:800; color:#f1f5f9; line-height:1;">
-              {total_products}</div>
-            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:11px; color:#475569; margin-top:4px;
-                        text-transform:uppercase; letter-spacing:1px;">Products</div>
-          </td>
-          <td width="33%" style="padding:20px 0; text-align:center;
-                                  border-right:1px solid #1e293b;">
-            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:30px; font-weight:800; color:#f1f5f9; line-height:1;">
-              {total_categories}</div>
-            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:11px; color:#475569; margin-top:4px;
-                        text-transform:uppercase; letter-spacing:1px;">Categories</div>
-          </td>
-          <td width="34%" style="padding:20px 0; text-align:center;">
-            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:30px; font-weight:800; color:#ff4d6d; line-height:1;">
-              {critical_count}</div>
-            <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:11px; color:#475569; margin-top:4px;
-                        text-transform:uppercase; letter-spacing:1px;">Out of Stock</div>
-          </td>
-        </tr></table>
-      </td>
-    </tr>
-
-    <!-- ══ PRODUCT TABLE ══ -->
-    <tr>
-      <td style="background:#0a1628; border-left:1px solid #1e3a5f;
-                 border-right:1px solid #1e3a5f; border-top:1px solid #1e293b;">
-        <table width="100%" cellpadding="0" cellspacing="0">
-          <tr style="background:#080f1e;">
-            <th width="56" style="padding:12px 16px; text-align:center;
-                font-family:'Segoe UI',Helvetica,Arial,sans-serif; font-size:10px;
-                font-weight:700; letter-spacing:1.5px; text-transform:uppercase;
-                color:#334155;">IMG</th>
-            <th style="padding:12px 8px; text-align:left;
-                font-family:'Segoe UI',Helvetica,Arial,sans-serif; font-size:10px;
-                font-weight:700; letter-spacing:1.5px; text-transform:uppercase;
-                color:#334155;">Product</th>
-            <th width="110" style="padding:12px 16px; text-align:center;
-                font-family:'Segoe UI',Helvetica,Arial,sans-serif; font-size:10px;
-                font-weight:700; letter-spacing:1.5px; text-transform:uppercase;
-                color:#334155;">In Stock</th>
-          </tr>
-          {sections_html}
-        </table>
-      </td>
-    </tr>
-
-    <!-- ══ FOOTER ══ -->
-    <tr>
-      <td style="background:#080f1e; border:1px solid #1e3a5f;
-                 border-top:1px solid #1e293b; border-radius:0 0 16px 16px;
-                 padding:20px 32px;">
-        <table width="100%" cellpadding="0" cellspacing="0"><tr>
-          <td style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                     font-size:11px; color:#334155;">
-            Auto-generated by Inventory Alert System
-          </td>
-          <td align="right"
-              style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                     font-size:11px; color:#334155;">
-            {low_count} low &nbsp;·&nbsp;
-            <span style="color:#ff4d6d;">{critical_count} out</span>
-          </td>
-        </tr></table>
-      </td>
-    </tr>
-
-  </table>
-  </td></tr>
-</table>
-</body>
-</html>"""
-
-print("✅ HTML built.", flush=True)
-
-
-# ─────────────────────────────────────────────
-#  6. ASSEMBLE & SEND EMAIL
-# ─────────────────────────────────────────────
-print(f"📤 Sending elite email to {SMTP_TO}...", flush=True)
-
-msg_related = MIMEMultipart("related")
-msg_related["Subject"] = (
-    f"⚠️ Low Stock Alert — {total_products} product{'s' if total_products != 1 else ''} "
-    f"· {critical_count} out of stock · {utc_now().strftime('%d %b %Y')}"
+print(
+    f"   ↳ Split into {total_batches} email(s) "
+    f"(max {MAX_IMAGES_PER_EMAIL} unique images each).",
+    flush=True,
 )
-msg_related["From"] = SMTP_FROM
-msg_related["To"]   = SMTP_TO
 
-msg_alt = MIMEMultipart("alternative")
-msg_alt.attach(MIMEText(full_html, "html"))
-msg_related.attach(msg_alt)
 
-# Attach UNIQUE images only (if CID mode)
-if use_cid:
-    attached = 0
-    for img_hash, img_bytes in hash_to_bytes.items():
-        try:
-            img_part = MIMEImage(img_bytes, _subtype="png")
-            img_part.add_header("Content-ID",          f"<img_{img_hash}>")
-            img_part.add_header("Content-Disposition", "inline",
-                                filename=f"img_{img_hash}.png")
-            msg_related.attach(img_part)
-            attached += 1
-        except Exception as exc:
-            print(f"   ⚠️  Could not attach image {img_hash}: {exc}", flush=True)
-    print(f"   ↳ Attached {attached} unique image(s).", flush=True)
+# ─────────────────────────────────────────────
+#  6. BUILD & SEND ONE EMAIL PER BATCH
+# ─────────────────────────────────────────────
+print(f"📤 Sending to {SMTP_TO}...", flush=True)
 
-try:
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-        server.ehlo()
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg_related)
-    print("✅ Elite email sent successfully!", flush=True)
-except Exception as exc:
-    print(f"❌ Failed to send email: {exc}", flush=True)
-    sys.exit(1)
+for i, (batch, batch_imgs) in enumerate(zip(batches, batch_img_sets), start=1):
+    part_label = f"Part {i}/{total_batches}" if total_batches > 1 else ""
+
+    subject = (
+        f"⚠️ Low Stock Alert"
+        + (f" [{part_label}]" if part_label else "")
+        + f" — {total_products} product{'s' if total_products != 1 else ''}"
+        + f" · {critical_count} out of stock"
+        + f" · {utc_now().strftime('%d %b %Y')}"
+    )
+
+    html = build_html(
+        batch         = batch,
+        qty_field     = qty_field,
+        product_hash_map = product_hash_map,
+        part_label    = part_label,
+        total_products   = total_products,
+        total_categories = total_categories,
+        critical_count   = critical_count,
+        low_count        = low_count,
+    )
+
+    try:
+        send_email(html, batch_imgs, subject)
+        print(
+            f"   ✅ Email {i}/{total_batches} sent "
+            f"({len(batch)} products · {len(batch_imgs)} image attachment(s)).",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"   ❌ Email {i}/{total_batches} failed: {exc}", flush=True)
+        sys.exit(1)
+
+print("✅ All emails sent successfully!", flush=True)
