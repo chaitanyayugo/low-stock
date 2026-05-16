@@ -740,17 +740,20 @@ def send_email(
     msg_related.attach(msg_alt)
 
     # One inline image part per UNIQUE image hash — no duplicates, no SVG
+    # NOTE: Content-Disposition is intentionally OMITTED.
+    # Setting it (even as "inline") causes Gmail to show every image as a
+    # visible attachment below the email. Without it, Gmail treats them as
+    # embedded body resources referenced only by their CID.
     for img_hash, img_bytes in unique_images.items():
         try:
-            # Sniff format: JPEG starts FF D8, PNG starts 89 50 4E 47
+            # Sniff format: JPEG starts FF D8, everything else treat as PNG
             if img_bytes[:2] == b"\xff\xd8":
                 subtype = "jpeg"
             else:
                 subtype = "png"
             img_part = MIMEImage(img_bytes, _subtype=subtype)
-            img_part.add_header("Content-ID",          f"<{img_hash}>")
-            img_part.add_header("Content-Disposition", "inline",
-                                filename=f"{img_hash}.{subtype}")
+            img_part.add_header("Content-ID", f"<{img_hash}>")
+            # No Content-Disposition header — keeps images out of attachment tray
             msg_related.attach(img_part)
         except Exception as e:
             print(f"   ⚠️  Could not attach image {img_hash[:8]}…: {e}", flush=True)
