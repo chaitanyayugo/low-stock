@@ -1,12 +1,11 @@
 import xmlrpc.client
 import requests
-import base64
 import smtplib
 import os
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-print("Start CH-625 test with MIME detection")
+print("Minimal image test – using direct Odoo image URL")
 
 ODOO_URL = os.environ.get("ODOO_URL")
 ODOO_DB = os.environ.get("ODOO_DB")
@@ -27,59 +26,40 @@ if not uid:
     raise Exception("Odoo auth failed")
 models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-# Find product
+# Find product CH-625
 pids = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'product.product', 'search',
     [[['name', 'ilike', 'CH-625']]], {'limit': 1})
 if not pids:
     print("Product not found")
     exit(1)
 pid = pids[0]
-print("Product ID:", pid)
+print(f"Product ID: {pid}")
 
-# Fetch image
-url = f"{ODOO_URL}/web/image/product.product/{pid}/image_128"
-session = requests.Session()
-session.auth = (ODOO_USER, ODOO_PASSWORD)
-resp = session.get(url, timeout=10)
+# Build image URL (direct, not base64)
+image_url = f"{ODOO_URL}/web/image/product.product/{pid}/image_128"
 
-img_src = ""
-if resp.status_code == 200 and len(resp.content) > 100:
-    # Detect content type from response headers
-    content_type = resp.headers.get('Content-Type', 'image/jpeg')
-    if content_type.startswith('image/'):
-        mime = content_type
-    else:
-        # fallback: guess from magic bytes
-        if resp.content[:4] == b'\x89PNG':
-            mime = 'image/png'
-        else:
-            mime = 'image/jpeg'
-    
-    b64 = base64.b64encode(resp.content).decode('utf-8')
-    img_src = f"data:{mime};base64,{b64}"
-    print(f"Image fetched: {len(resp.content)} bytes, MIME: {mime}")
-else:
-    print("No image or too small")
-# After resp = session.get(...)
-if resp.status_code == 200 and len(resp.content) > 100:
-    with open('/tmp/test_image.jpg', 'wb') as f:
-        f.write(resp.content)
-    print(f"Saved image to /tmp/test_image.jpg, size: {len(resp.content)}")
-    # Optional: print first few bytes to detect file signature
-    print("First 8 bytes:", resp.content[:8])
-# Build HTML (simple, no extra spaces)
-html = f'<html><body><h2>CH-625 Dining Chair</h2><img src="{img_src}" width="150"/><p>If you see the product image, it works.</p></body></html>'
+# Simple HTML with direct image URL
+html = f"""
+<html>
+<body>
+<h2>CH-625 Dining Chair</h2>
+<img src="{image_url}" width="200" />
+<p>If you see the image above (maybe after clicking "Load images"), the direct URL works.</p>
+</body>
+</html>
+"""
 
 # Send email
 msg = MIMEMultipart("alternative")
-msg["Subject"] = "CH-625 Image Test (MIME fixed)"
+msg["Subject"] = "Minimal image test – direct URL"
 msg["From"] = SMTP_FROM
 msg["To"] = SMTP_TO
 msg.attach(MIMEText(html, "html"))
 
+print(f"Connecting to SMTP {SMTP_HOST}:{SMTP_PORT}...")
 with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
     server.starttls()
     server.login(SMTP_USER, SMTP_PASSWORD)
     server.send_message(msg)
 
-print("Done")
+print("Email sent. Check inbox.")
