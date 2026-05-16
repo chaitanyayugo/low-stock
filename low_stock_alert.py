@@ -33,7 +33,7 @@ print("✅ Connected to Odoo", flush=True)
 
 # ---------- 2. FETCH LOW STOCK QUANTS ----------
 print("📦 Fetching low‑stock quants...", flush=True)
-domain = [["location_id.usage", "=", "internal"], ["quantity", "<", 5]]
+domain = [["location_id.usage", "=", "internal"], ["quantity", "<", 1]]
 quants = models.execute_kw(
     ODOO_DB,
     uid,
@@ -54,10 +54,11 @@ print(
     flush=True,
 )
 
-# ---------- 3. UNIQUE PRODUCT IDs ----------
-product_ids = list({q["product_id"][0] for q in quants if q["product_id"]})
+# ---------- 3. UNIQUE PRODUCT IDs (LIMIT TO 2) ----------
+unique_product_ids = {q["product_id"][0] for q in quants if q["product_id"]}
+product_ids = list(unique_product_ids)[:2]  # Only 2 products
 total_products = len(product_ids)
-print(f"🖼️ Will download images for {total_products} products.", flush=True)
+print(f"🖼️ Will download images for {total_products} products (limited to top 2).", flush=True)
 
 # ---------- 4. FETCH IMAGES WITH PROGRESS ----------
 def get_product_image_base64(product_id):
