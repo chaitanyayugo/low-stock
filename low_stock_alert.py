@@ -3,24 +3,26 @@ import requests
 import base64
 import smtplib
 import os
+import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime
 
-print("🟢 Starting low‑stock alert script...", flush=True)
+print("🟢 Efficient low‑stock alert – only downloads images for top N products")
 
 # ---------- CONFIGURATION ----------
-ODOO_URL = os.environ.get("ODOO_URL", "https://your-odoo-url.com")
+ODOO_URL = os.environ.get("ODOO_URL")
 ODOO_DB = os.environ.get("ODOO_DB")
 ODOO_USER = os.environ.get("ODOO_USER")
 ODOO_PASSWORD = os.environ.get("ODOO_PASSWORD")
-
 SMTP_HOST = os.environ.get("SMTP_HOST")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
 SMTP_USER = os.environ.get("SMTP_USER")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM = os.environ.get("SMTP_FROM")
 SMTP_TO = os.environ.get("SMTP_TO")
+
+# Set how many products to include in the email
+TOP_LIMIT = 10   # Change to 50, 100, etc. later
 
 # ---------- 1. CONNECT TO ODOO ----------
 print("🔌 Connecting to Odoo...", flush=True)
@@ -29,136 +31,97 @@ uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
 if not uid:
     raise Exception("❌ Odoo authentication failed")
 models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
-print("✅ Connected to Odoo", flush=True)
+print("✅ Connected", flush=True)
 
 # ---------- 2. FETCH LOW STOCK QUANTS ----------
 print("📦 Fetching low‑stock quants...", flush=True)
-domain = [["location_id.usage", "=", "internal"], ["quantity", "<", 1]]
-quants = models.execute_kw(
-    ODOO_DB,
-    uid,
-    ODOO_PASSWORD,
-    "stock.quant",
-    "search_read",
+domain = [["location_id.usage", "=", "internal"], ["quantity", "<", 5]]
+quants = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'stock.quant', 'search_read',
     [domain],
     {"fields": ["id", "product_id", "location_id", "quantity", "reserved_quantity"]}
 )
-
 if not quants:
-    print("✅ No low‑stock products found. Exiting.", flush=True)
+    print("✅ No low‑stock products found.")
     exit(0)
+print(f"📦 Found {len(quants)} records.", flush=True)
 
-print(
-    f"📦 Found {len(quants)} low‑stock records. Unique products to process: "
-    f"{len(set(q['product_id'][0] for q in quants if q['product_id']))}",
-    flush=True,
-)
+# ---------- 3. SORT AND TAKE TOP N ----------
+quants_sorted = sorted(quants, key=lambda q: q['quantity'])  # lowest stock first
+quants_limited = quants_sorted[:TOP_LIMIT]
 
-# ---------- 3. UNIQUE PRODUCT IDs (LIMIT TO 2) ----------
-unique_product_ids = {q["product_id"][0] for q in quants if q["product_id"]}
-product_ids = list(unique_product_ids)[:2]  # Only 2 products
-print(f"🖼️ Will download images for {len(product_ids)} products (only 2).", flush=True)
+# Get unique product IDs from ONLY the limited list
+product_ids = list({q["product_id"][0] for q in quants_limited if q["product_id"]})
+print(f"🖼️ Will download images for {len(product_ids)} products (limit {TOP_LIMIT}).", flush=True)
 
-# ---------- 4. DOWNLOAD ONLY 2 PRODUCT IMAGES ----------
+# ---------- 4. DOWNLOAD IMAGES (only for those products) ----------
 def get_product_image_base64(product_id):
     url = f"{ODOO_URL}/web/image/product.product/{product_id}/image_128"
     session = requests.Session()
     session.auth = (ODOO_USER, ODOO_PASSWORD)
     try:
         resp = session.get(url, timeout=10)
-        if resp.status_code == 200:
-            b64 = base64.b64encode(resp.content).decode("utf-8")
+        if resp.status_code == 200 and len(resp.content) > 100:
+            b64 = base64.b64encode(resp.content).decode('utf-8')
             return f"data:image/png;base64,{b64}"
-    except Exception as e:
-        print(f"⚠️ Failed to fetch image for product {product_id}: {e}")
+    except:
         pass
-    # transparent placeholder
-    return (
-        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-    )
+    return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 
 product_image_map = {}
-for pid in product_ids:
+for idx, pid in enumerate(product_ids, start=1):
     product_image_map[pid] = get_product_image_base64(pid)
-print("✅ Downloaded images for 2 products", flush=True)
+    print(f"   Downloaded {idx}/{len(product_ids)}", flush=True)
+print("✅ All images downloaded", flush=True)
 
-# ---------- 5. BUILD EMAIL HTML (ONLY 2 PRODUCTS) ----------
-print("📧 Building email HTML with 2 products...", flush=True)
+# ---------- 5. BUILD EMAIL HTML ----------
+print("📧 Building email...", flush=True)
 rows = ""
-for product_id in product_ids:
-    # Find one quant for this product (email only 1 row per product)
-    q = next(qq for qq in quants if qq["product_id"][0] == product_id)
-    product_name = q["product_id"][1]
-    location_name = q["location_id"][1] if q["location_id"] else "Unknown"
-    quantity = q["quantity"]
+for q in quants_limited:
+    pid = q["product_id"][0]
+    pname = q["product_id"][1]
+    loc = q["location_id"][1] if q["location_id"] else "Unknown"
+    qty = q["quantity"]
     reserved = q["reserved_quantity"]
-    img_src = product_image_map[product_id]
+    img = product_image_map.get(pid, "")
     rows += f"""
     <tr style="border-bottom:1px solid #eee;">
-        <td style="padding:12px 15px; text-align:center;">
-            <img src="{img_src}" style="width:40px; height:40px; object-fit:cover; border-radius:6px;">
-        </td>
-        <td style="padding:12px 15px; font-family:Helvetica; font-size:14px; font-weight:500;">
-            {product_name}
-        </td>
-        <td style="padding:12px 15px;">
-            <span style="background:#f3f4f6; padding:4px 8px; border-radius:4px;">{location_name}</span>
-        </td>
-        <td style="padding:12px 15px; text-align:center;">
-            <span style="background:#fff1f0; color:#cf1322; padding:4px 10px; border-radius:12px; font-weight:bold;">
-                {quantity}
-            </span>
-        </td>
-        <td style="padding:12px 15px; text-align:center; color:#999;">
-            {reserved}
-        </td>
+        <td style="padding:12px 15px; text-align:center;"><img src="{img}" width="40"></td>
+        <td style="padding:12px 15px;">{pname}</td>
+        <td style="padding:12px 15px;">{loc}</td>
+        <td style="padding:12px 15px; text-align:center; font-weight:bold; color:#cf1322;">{qty}</td>
+        <td style="padding:12px 15px; text-align:center;">{reserved}</td>
     </tr>
     """
-
 full_html = f"""
-<div style="background:#f9fafb; padding:40px 10px; font-family:Helvetica;">
-  <div style="max-width:800px; margin:0 auto; background:#fff; border-radius:8px; border:1px solid #e5e7eb;">
-    <div style="background:#111827; padding:25px 30px;">
-      <h1 style="color:#fff; margin:0;">⚠️ Inventory Alert: Low Stock Report</h1>
-      <p style="color:#9ca3af;">The following items are below threshold of 5 units</p>
-    </div>
-    <table style="width:100%; border-collapse:collapse;">
-      <thead>
-        <tr style="background:#f8fafc; border-bottom:2px solid #e5e7eb;">
-          <th style="padding:15px; text-align:center;">Image</th>
-          <th style="padding:15px; text-align:left;">Product Name</th>
-          <th style="padding:15px; text-align:left;">Location</th>
-          <th style="padding:15px; text-align:center;">In Stock</th>
-          <th style="padding:15px; text-align:center;">Reserved</th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows}
-      </tbody>
-    </table>
-    <div style="padding:20px 30px; background:#fefefe; border-top:1px solid #eee; text-align:right;">
-      <p style="margin:0; font-size:12px; color:#9ca3af;">
-        Generated by GitHub Actions • {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
-      </p>
-    </div>
-  </div>
-</div>
+<html><body>
+<h2>Low Stock Alert (Top {TOP_LIMIT} of {len(quants)})</h2>
+<table border="1" cellpadding="5" cellspacing="0">
+<tr><th>Image</th><th>Product</th><th>Location</th><th>Stock</th><th>Reserved</th></tr>
+{rows}
+</table>
+<p>Generated by GitHub Actions • {time.strftime('%Y-%m-%d %H:%M UTC')}</p>
+</body></html>
 """
 
 # ---------- 6. SEND EMAIL ----------
 print(f"📤 Sending email to {SMTP_TO}...", flush=True)
 msg = MIMEMultipart("alternative")
-msg["Subject"] = f"Low Stock Alert – {datetime.utcnow().strftime('%Y-%m-%d')}"
+msg["Subject"] = f"Low Stock Alert (Top {TOP_LIMIT}) – {time.strftime('%Y-%m-%d')}"
 msg["From"] = SMTP_FROM
 msg["To"] = SMTP_TO
 msg.attach(MIMEText(full_html, "html"))
 
-try:
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg)
-    print("✅ Email sent successfully", flush=True)
-except Exception as e:
-    print(f"❌ Failed to send email: {e}")
-    raise
+for attempt in range(3):
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        print("✅ Email sent")
+        break
+    except Exception as e:
+        print(f"   Attempt {attempt+1} failed: {e}")
+        if attempt < 2:
+            time.sleep(10)
+        else:
+            raise
