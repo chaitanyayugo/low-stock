@@ -57,14 +57,12 @@ print(
 # ---------- 3. UNIQUE PRODUCT IDs (LIMIT TO 2) ----------
 unique_product_ids = {q["product_id"][0] for q in quants if q["product_id"]}
 product_ids = list(unique_product_ids)[:2]  # Only 2 products
-total_products = len(product_ids)
-print(f"🖼️ Will download images for {total_products} products (limited to top 2).", flush=True)
+print(f"🖼️ Will download images for {len(product_ids)} products (only 2).", flush=True)
 
-# ---------- 4. FETCH IMAGES WITH PROGRESS ----------
+# ---------- 4. DOWNLOAD ONLY 2 PRODUCT IMAGES ----------
 def get_product_image_base64(product_id):
     url = f"{ODOO_URL}/web/image/product.product/{product_id}/image_128"
     session = requests.Session()
-    # Use Odoo basic auth (works with SaaS if auth is allowed to robots / API)
     session.auth = (ODOO_USER, ODOO_PASSWORD)
     try:
         resp = session.get(url, timeout=10)
@@ -80,28 +78,21 @@ def get_product_image_base64(product_id):
     )
 
 product_image_map = {}
-for idx, pid in enumerate(product_ids, start=1):
+for pid in product_ids:
     product_image_map[pid] = get_product_image_base64(pid)
-    if idx % 10 == 0 or idx == total_products:
-        print(f"   Progress: {idx}/{total_products} product images downloaded", flush=True)
-print("✅ All images downloaded", flush=True)
+print("✅ Downloaded images for 2 products", flush=True)
 
 # ---------- 5. BUILD EMAIL HTML (ONLY 2 PRODUCTS) ----------
-print("📧 Building email HTML...", flush=True)
+print("📧 Building email HTML with 2 products...", flush=True)
 rows = ""
-products_shown = 0
-for q in quants:
-    product_id = q["product_id"][0]
-    if product_id not in product_image_map:
-        continue  # skip products not in our 2‑product list
-    if products_shown >= 2:
-        continue  # only 2 rows
-
+for product_id in product_ids:
+    # Find one quant for this product (email only 1 row per product)
+    q = next(qq for qq in quants if qq["product_id"][0] == product_id)
     product_name = q["product_id"][1]
     location_name = q["location_id"][1] if q["location_id"] else "Unknown"
     quantity = q["quantity"]
     reserved = q["reserved_quantity"]
-    img_src = product_image_map.get(product_id, "")
+    img_src = product_image_map[product_id]
     rows += f"""
     <tr style="border-bottom:1px solid #eee;">
         <td style="padding:12px 15px; text-align:center;">
@@ -123,7 +114,6 @@ for q in quants:
         </td>
     </tr>
     """
-    products_shown += 1
 
 full_html = f"""
 <div style="background:#f9fafb; padding:40px 10px; font-family:Helvetica;">
