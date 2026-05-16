@@ -7,9 +7,8 @@ import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-print("🟢 Efficient low‑stock alert – only downloads images for top N products")
+print("🟢 EFFICIENT – Only downloads images for top N products")
 
-# ---------- CONFIGURATION ----------
 ODOO_URL = os.environ.get("ODOO_URL")
 ODOO_DB = os.environ.get("ODOO_DB")
 ODOO_USER = os.environ.get("ODOO_USER")
@@ -21,60 +20,48 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM = os.environ.get("SMTP_FROM")
 SMTP_TO = os.environ.get("SMTP_TO")
 
-# Set how many products to include in the email
-TOP_LIMIT = 10   # Change to 50, 100, etc. later
+TOP_LIMIT = 10   # Change to 100 later
 
-# ---------- 1. CONNECT TO ODOO ----------
-print("🔌 Connecting to Odoo...", flush=True)
+# Connect
 common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
 uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
 if not uid:
-    raise Exception("❌ Odoo authentication failed")
+    raise Exception("Odoo auth failed")
 models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
-print("✅ Connected", flush=True)
 
-# ---------- 2. FETCH LOW STOCK QUANTS ----------
-print("📦 Fetching low‑stock quants...", flush=True)
+# Fetch quants
 domain = [["location_id.usage", "=", "internal"], ["quantity", "<", 5]]
 quants = models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, 'stock.quant', 'search_read',
     [domain],
-    {"fields": ["id", "product_id", "location_id", "quantity", "reserved_quantity"]}
-)
+    {"fields": ["id", "product_id", "location_id", "quantity", "reserved_quantity"]})
 if not quants:
-    print("✅ No low‑stock products found.")
+    print("No low stock")
     exit(0)
-print(f"📦 Found {len(quants)} records.", flush=True)
 
-# ---------- 3. SORT AND TAKE TOP N ----------
-quants_sorted = sorted(quants, key=lambda q: q['quantity'])  # lowest stock first
+# Take top N
+quants_sorted = sorted(quants, key=lambda q: q['quantity'])
 quants_limited = quants_sorted[:TOP_LIMIT]
-
-# Get unique product IDs from ONLY the limited list
 product_ids = list({q["product_id"][0] for q in quants_limited if q["product_id"]})
-print(f"🖼️ Will download images for {len(product_ids)} products (limit {TOP_LIMIT}).", flush=True)
+print(f"Downloading images for {len(product_ids)} products (limit {TOP_LIMIT})")
 
-# ---------- 4. DOWNLOAD IMAGES (only for those products) ----------
-def get_product_image_base64(product_id):
-    url = f"{ODOO_URL}/web/image/product.product/{product_id}/image_128"
-    session = requests.Session()
-    session.auth = (ODOO_USER, ODOO_PASSWORD)
+# Download images only for those
+def get_image(pid):
     try:
-        resp = session.get(url, timeout=10)
+        resp = requests.get(f"{ODOO_URL}/web/image/product.product/{pid}/image_128",
+                            auth=(ODOO_USER, ODOO_PASSWORD), timeout=10)
         if resp.status_code == 200 and len(resp.content) > 100:
-            b64 = base64.b64encode(resp.content).decode('utf-8')
+            b64 = base64.b64encode(resp.content).decode()
             return f"data:image/png;base64,{b64}"
     except:
         pass
     return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 
-product_image_map = {}
-for idx, pid in enumerate(product_ids, start=1):
-    product_image_map[pid] = get_product_image_base64(pid)
-    print(f"   Downloaded {idx}/{len(product_ids)}", flush=True)
-print("✅ All images downloaded", flush=True)
+img_map = {}
+for i, pid in enumerate(product_ids, 1):
+    img_map[pid] = get_image(pid)
+    print(f"  Downloaded {i}/{len(product_ids)}")
 
-# ---------- 5. BUILD EMAIL HTML ----------
-print("📧 Building email...", flush=True)
+# Build HTML
 rows = ""
 for q in quants_limited:
     pid = q["product_id"][0]
@@ -82,46 +69,35 @@ for q in quants_limited:
     loc = q["location_id"][1] if q["location_id"] else "Unknown"
     qty = q["quantity"]
     reserved = q["reserved_quantity"]
-    img = product_image_map.get(pid, "")
+    img = img_map.get(pid, "")
     rows += f"""
-    <tr style="border-bottom:1px solid #eee;">
-        <td style="padding:12px 15px; text-align:center;"><img src="{img}" width="40"></td>
-        <td style="padding:12px 15px;">{pname}</td>
-        <td style="padding:12px 15px;">{loc}</td>
-        <td style="padding:12px 15px; text-align:center; font-weight:bold; color:#cf1322;">{qty}</td>
-        <td style="padding:12px 15px; text-align:center;">{reserved}</td>
+    <tr>
+        <td><img src="{img}" width="40"></td>
+        <td>{pname}</td>
+        <td>{loc}</td>
+        <td align="center"><b>{qty}</b></td>
+        <td align="center">{reserved}</td>
     </tr>
-    """
-full_html = f"""
+html = f"""
 <html><body>
 <h2>Low Stock Alert (Top {TOP_LIMIT} of {len(quants)})</h2>
-<table border="1" cellpadding="5" cellspacing="0">
+<table border="1">
 <tr><th>Image</th><th>Product</th><th>Location</th><th>Stock</th><th>Reserved</th></tr>
 {rows}
 </table>
-<p>Generated by GitHub Actions • {time.strftime('%Y-%m-%d %H:%M UTC')}</p>
+<p>{time.strftime('%Y-%m-%d %H:%M UTC')}</p>
 </body></html>
 """
 
-# ---------- 6. SEND EMAIL ----------
-print(f"📤 Sending email to {SMTP_TO}...", flush=True)
+# Send email
 msg = MIMEMultipart("alternative")
-msg["Subject"] = f"Low Stock Alert (Top {TOP_LIMIT}) – {time.strftime('%Y-%m-%d')}"
+msg["Subject"] = f"Low Stock Alert – Top {TOP_LIMIT} (Test)"
 msg["From"] = SMTP_FROM
 msg["To"] = SMTP_TO
-msg.attach(MIMEText(full_html, "html"))
+msg.attach(MIMEText(html, "html"))
 
-for attempt in range(3):
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.send_message(msg)
-        print("✅ Email sent")
-        break
-    except Exception as e:
-        print(f"   Attempt {attempt+1} failed: {e}")
-        if attempt < 2:
-            time.sleep(10)
-        else:
-            raise
+with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+    server.starttls()
+    server.login(SMTP_USER, SMTP_PASSWORD)
+    server.send_message(msg)
+print("Email sent")
