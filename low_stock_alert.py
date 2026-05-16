@@ -1,7 +1,6 @@
 import sys
 import os
 import re
-import io
 import base64
 import hashlib
 import smtplib
@@ -29,7 +28,19 @@ SMTP_PORT     = int(os.environ.get("SMTP_PORT", 587))
 SMTP_USER     = os.environ.get("SMTP_USER")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM     = os.environ.get("SMTP_FROM")
-SMTP_TO       = os.environ.get("SMTP_TO")
+
+# ── Recipients ───────────────────────────────────────────────────────────
+# List every address here. All will appear in the To: header and each
+# will receive the email. Add/remove lines freely.
+SMTP_TO = [
+    os.environ.get("SMTP_TO_1", "recipient1@example.com"),
+    os.environ.get("SMTP_TO_2", "recipient2@example.com"),
+    os.environ.get("SMTP_TO_3", "recipient3@example.com"),
+    os.environ.get("SMTP_TO_4", "recipient4@example.com"),
+    os.environ.get("SMTP_TO_5", "recipient5@example.com"),
+]
+# Strip blanks (in case env vars aren't all set)
+SMTP_TO = [a.strip() for a in SMTP_TO if a and a.strip()]
 
 LOW_STOCK_THRESHOLD = 5
 
@@ -70,77 +81,132 @@ def avatar_color(name: str) -> str:
     return AVATAR_COLORS[idx]
 
 
+# ── 5×7 bitmap glyphs for A-Z and ? (each column is a bitmask, top=LSB) ──
+_GLYPHS: dict[str, list[int]] = {
+    "A": [0x7E,0x11,0x11,0x11,0x7E], "B": [0x7F,0x49,0x49,0x49,0x36],
+    "C": [0x3E,0x41,0x41,0x41,0x22], "D": [0x7F,0x41,0x41,0x22,0x1C],
+    "E": [0x7F,0x49,0x49,0x49,0x41], "F": [0x7F,0x09,0x09,0x09,0x01],
+    "G": [0x3E,0x41,0x49,0x49,0x7A], "H": [0x7F,0x08,0x08,0x08,0x7F],
+    "I": [0x00,0x41,0x7F,0x41,0x00], "J": [0x20,0x40,0x41,0x3F,0x01],
+    "K": [0x7F,0x08,0x14,0x22,0x41], "L": [0x7F,0x40,0x40,0x40,0x40],
+    "M": [0x7F,0x02,0x0C,0x02,0x7F], "N": [0x7F,0x04,0x08,0x10,0x7F],
+    "O": [0x3E,0x41,0x41,0x41,0x3E], "P": [0x7F,0x09,0x09,0x09,0x06],
+    "Q": [0x3E,0x41,0x51,0x21,0x5E], "R": [0x7F,0x09,0x19,0x29,0x46],
+    "S": [0x46,0x49,0x49,0x49,0x31], "T": [0x01,0x01,0x7F,0x01,0x01],
+    "U": [0x3F,0x40,0x40,0x40,0x3F], "V": [0x1F,0x20,0x40,0x20,0x1F],
+    "W": [0x3F,0x40,0x38,0x40,0x3F], "X": [0x63,0x14,0x08,0x14,0x63],
+    "Y": [0x07,0x08,0x70,0x08,0x07], "Z": [0x61,0x51,0x49,0x45,0x43],
+    "?": [0x02,0x01,0x51,0x09,0x06],
+}
+
+
+def _make_png(pixels: list[list[tuple[int,int,int]]]) -> bytes:
+    """
+    Encode a 2-D list of (R,G,B) tuples as a valid PNG using only
+    struct + zlib from the stdlib. No external dependencies.
+    """
+    h = len(pixels)
+    w = len(pixels[0]) if h else 0
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    # IHDR
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)  # 8-bit RGB
+
+    # IDAT — one filter byte (0 = None) per row, then raw RGB bytes
+    raw = b"".join(
+        b"�" + bytes(c for px in row for c in px)
+        for row in pixels
+    )
+    idat = zlib.compress(raw, 9)
+
+    return (
+        b"PNG
+
+"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", idat)
+        + chunk(b"IEND", b"")
+    )
+
+
 def letter_avatar_png_bytes(name: str) -> bytes:
     """
-    Return PNG bytes for a gold letter avatar.
-    Rendered with Pillow — 100% Gmail-safe, no SVG.
-    Falls back to a solid-colour PNG if font rendering fails.
+    Pure-stdlib PNG avatar — gradient background + bold letter.
+    No Pillow, no SVG, 100 % Gmail-safe.
     """
-    from PIL import Image, ImageDraw, ImageFont
+    letter = (_GLYPHS.get((name or "?")[0].upper()) and (name or "?")[0].upper()) or "?"
+    glyph  = _GLYPHS.get(letter, _GLYPHS["?"])
 
-    letter = (name or "?")[0].upper()
     hex_color = avatar_color(name)
-
-    # Parse hex colour → RGB tuple
     h = hex_color.lstrip("#")
-    top_rgb    = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
-    bottom_rgb = (10, 10, 15)   # #0a0a0f
-    gold_rgb   = (232, 201, 109) # #e8c96d
-    border_rgb = (201, 168, 76)  # #c9a84c
+    top = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))   # top-of-gradient
+    bot = (10, 10, 15)                                     # #0a0a0f
+    gold   = (232, 201, 109)                               # #e8c96d letter
+    border = (201, 168, 76)                                # #c9a84c 1-px rim
 
-    size = IMG_SIZE
+    S   = IMG_SIZE       # e.g. 66
+    RX  = max(8, S // 8) # corner radius in pixels
 
-    # ── Draw gradient background ──────────────────────────────────────────
-    img  = Image.new("RGB", (size, size))
-    draw = ImageDraw.Draw(img)
+    # ── Build pixel grid ──────────────────────────────────────────────────
+    pixels: list[list[tuple[int,int,int]]] = []
 
-    for y in range(size):
-        t = y / (size - 1)
-        r = int(top_rgb[0] + (bottom_rgb[0] - top_rgb[0]) * t)
-        g = int(top_rgb[1] + (bottom_rgb[1] - top_rgb[1]) * t)
-        b = int(top_rgb[2] + (bottom_rgb[2] - top_rgb[2]) * t)
-        draw.line([(0, y), (size, y)], fill=(r, g, b))
+    # Glyph scale: each bit → SCALE×SCALE block; glyph is 5 cols × 7 rows
+    SCALE = max(1, S // 14)      # ~4–5 px per bit at 66 px
+    GW    = 5 * SCALE            # glyph pixel width
+    GH    = 7 * SCALE            # glyph pixel height
+    ox    = (S - GW) // 2        # x offset to centre
+    oy    = (S - GH) // 2        # y offset to centre
 
-    # ── Rounded-rect mask (rx=12) ────────────────────────────────────────
-    mask = Image.new("L", (size, size), 0)
-    ImageDraw.Draw(mask).rounded_rectangle([0, 0, size - 1, size - 1],
-                                           radius=12, fill=255)
-    img.putalpha(mask)
+    def in_glyph(x: int, y: int) -> bool:
+        """True if pixel (x,y) should be lit gold."""
+        gx = (x - ox) // SCALE
+        gy = (y - oy) // SCALE
+        if 0 <= gx < 5 and 0 <= gy < 7:
+            return bool(glyph[gx] & (1 << gy))
+        return False
 
-    # ── Gold border ───────────────────────────────────────────────────────
-    draw = ImageDraw.Draw(img)
-    draw.rounded_rectangle([0, 0, size - 1, size - 1],
-                           radius=12, outline=border_rgb + (153,), width=1)
+    def in_rounded_rect(x: int, y: int) -> bool:
+        """True if (x,y) is inside the rounded rectangle."""
+        cx = min(x, S - 1 - x)
+        cy = min(y, S - 1 - y)
+        if cx >= RX or cy >= RX:
+            return True
+        dx, dy = RX - cx - 1, RX - cy - 1
+        return dx * dx + dy * dy <= (RX - 1) * (RX - 1)
 
-    # ── Letter ────────────────────────────────────────────────────────────
-    font_size = int(size * 0.50)
-    font = None
-    for path in [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSerifBold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    ]:
-        try:
-            font = ImageFont.truetype(path, font_size)
-            break
-        except Exception:
-            continue
+    def on_border(x: int, y: int) -> bool:
+        """True if (x,y) is the 1-px border of the rounded rect."""
+        if not in_rounded_rect(x, y):
+            return False
+        for nx, ny in ((x-1,y),(x+1,y),(x,y-1),(x,y+1)):
+            if 0 <= nx < S and 0 <= ny < S and not in_rounded_rect(nx, ny):
+                return True
+        return False
 
-    if font is None:
-        font = ImageFont.load_default()
+    for y in range(S):
+        row: list[tuple[int,int,int]] = []
+        t = y / max(S - 1, 1)
+        # gradient colour for this row
+        bg = (
+            int(top[0] + (bot[0] - top[0]) * t),
+            int(top[1] + (bot[1] - top[1]) * t),
+            int(top[2] + (bot[2] - top[2]) * t),
+        )
+        for x in range(S):
+            if not in_rounded_rect(x, y):
+                row.append(bot)          # outside rounded rect → darkest bg
+            elif on_border(x, y):
+                row.append(border)       # 1-px gold rim
+            elif in_glyph(x, y):
+                row.append(gold)         # letter pixel
+            else:
+                row.append(bg)           # gradient background
+        pixels.append(row)
 
-    bbox = draw.textbbox((0, 0), letter, font=font)
-    tw   = bbox[2] - bbox[0]
-    th   = bbox[3] - bbox[1]
-    tx   = (size - tw) // 2 - bbox[0]
-    ty   = (size - th) // 2 - bbox[1]
-    draw.text((tx, ty), letter, font=font, fill=gold_rgb)
-
-    # ── Export as PNG ─────────────────────────────────────────────────────
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+    return _make_png(pixels)
 
 
 def stock_level(qty: float) -> str:
@@ -668,7 +734,7 @@ def send_email(
     msg_related = MIMEMultipart("related")
     msg_related["Subject"] = subject
     msg_related["From"]    = SMTP_FROM
-    msg_related["To"]      = SMTP_TO
+    msg_related["To"]      = ", ".join(SMTP_TO)
 
     # HTML body
     msg_alt = MIMEMultipart("alternative")
@@ -695,7 +761,9 @@ def send_email(
         server.ehlo()
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg_related)
+        # Pass SMTP_TO as the explicit rcpttos list so every address
+        # in the list receives the message, regardless of the To: header.
+        server.send_message(msg_related, from_addr=SMTP_FROM, to_addrs=SMTP_TO)
 
 
 # ─────────────────────────────────────────────
