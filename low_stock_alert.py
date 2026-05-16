@@ -117,15 +117,13 @@ def _make_png(pixels: list[list[tuple[int,int,int]]]) -> bytes:
 
     # IDAT — one filter byte (0 = None) per row, then raw RGB bytes
     raw = b"".join(
-        b"�" + bytes(c for px in row for c in px)
+        b"\x00" + bytes(c for px in row for c in px)
         for row in pixels
     )
     idat = zlib.compress(raw, 9)
 
     return (
-        b"PNG
-
-"
+        b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", ihdr)
         + chunk(b"IDAT", idat)
         + chunk(b"IEND", b"")
