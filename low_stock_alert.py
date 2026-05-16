@@ -672,6 +672,12 @@ print(f"📦 Found {len(all_products)} low-stock product(s).", flush=True)
 
 # ─────────────────────────────────────────────
 #  3. IMAGES → INLINE DATA URIs  (zero attachments)
+#
+#  FIX: xmlrpc.client returns Odoo binary fields as xmlrpc.client.Binary
+#  objects (not plain bytes or base64 strings). Calling .data on a Binary
+#  gives the raw bytes directly — no base64 decode needed.
+#  For safety we also handle the case where Odoo returns a plain base64
+#  string (some versions / configurations do this).
 # ─────────────────────────────────────────────
 print("🖼️  Converting images to inline data URIs...", flush=True)
 
@@ -682,16 +688,38 @@ for p in all_products:
     p_id    = p["id"]
     raw_img = p.get("image_512")
     try:
-        if raw_img and str(raw_img) != "False":
-            s = raw_img.decode("utf-8") if isinstance(raw_img, bytes) else str(raw_img)
-            s = s.replace("\n", "").replace("\r", "").strip()
-            b = base64.b64decode(s)
-            h = hashlib.md5(b).hexdigest()
+        if raw_img and raw_img is not False and str(raw_img) != "False":
+
+            # ── Case 1: xmlrpc.client.Binary (most common with Odoo XML-RPC)
+            if isinstance(raw_img, xmlrpc.client.Binary):
+                img_bytes = raw_img.data          # already raw bytes — no decode
+
+            # ── Case 2: plain bytes — treat as raw image bytes directly
+            elif isinstance(raw_img, bytes):
+                # Try to base64-decode; if it fails the bytes ARE the image
+                try:
+                    img_bytes = base64.b64decode(raw_img, validate=True)
+                except Exception:
+                    img_bytes = raw_img
+
+            # ── Case 3: string — must be a base64-encoded image
+            elif isinstance(raw_img, str):
+                cleaned = raw_img.replace("\n", "").replace("\r", "").strip()
+                img_bytes = base64.b64decode(cleaned)
+
+            else:
+                product_data_uris[p_id] = ""
+                continue
+
+            # Deduplicate identical images
+            h = hashlib.md5(img_bytes).hexdigest()
             if h not in hash_to_uri:
-                hash_to_uri[h] = img_to_data_uri(b)
+                hash_to_uri[h] = img_to_data_uri(img_bytes)
             product_data_uris[p_id] = hash_to_uri[h]
+
         else:
             product_data_uris[p_id] = ""
+
     except Exception as exc:
         print(f"   ⚠️  Bad image for product {p_id}: {exc}", flush=True)
         product_data_uris[p_id] = ""
