@@ -60,7 +60,13 @@ if resp.status_code == 200 and len(resp.content) > 100:
     print(f"Image fetched: {len(resp.content)} bytes, MIME: {mime}")
 else:
     print("No image or too small")
-
+# After resp = session.get(...)
+if resp.status_code == 200 and len(resp.content) > 100:
+    with open('/tmp/test_image.jpg', 'wb') as f:
+        f.write(resp.content)
+    print(f"Saved image to /tmp/test_image.jpg, size: {len(resp.content)}")
+    # Optional: print first few bytes to detect file signature
+    print("First 8 bytes:", resp.content[:8])
 # Build HTML (simple, no extra spaces)
 html = f'<html><body><h2>CH-625 Dining Chair</h2><img src="{img_src}" width="150"/><p>If you see the product image, it works.</p></body></html>'
 
