@@ -1,9 +1,12 @@
 import sys
 import os
 import re
+import io
 import base64
 import hashlib
 import smtplib
+import struct
+import zlib
 import xmlrpc.client
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -67,27 +70,77 @@ def avatar_color(name: str) -> str:
     return AVATAR_COLORS[idx]
 
 
-def letter_avatar_svg_bytes(name: str) -> bytes:
-    """Return raw SVG bytes for a gold letter avatar."""
+def letter_avatar_png_bytes(name: str) -> bytes:
+    """
+    Return PNG bytes for a gold letter avatar.
+    Rendered with Pillow — 100% Gmail-safe, no SVG.
+    Falls back to a solid-colour PNG if font rendering fails.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
     letter = (name or "?")[0].upper()
-    color  = avatar_color(name)
-    svg = (
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{IMG_SIZE}" height="{IMG_SIZE}">'
-        f'<defs>'
-        f'<linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
-        f'<stop offset="0%" stop-color="{color}"/>'
-        f'<stop offset="100%" stop-color="#0a0a0f"/>'
-        f'</linearGradient>'
-        f'</defs>'
-        f'<rect width="{IMG_SIZE}" height="{IMG_SIZE}" rx="12" fill="url(#g)"/>'
-        f'<rect width="{IMG_SIZE}" height="{IMG_SIZE}" rx="12" fill="none" '
-        f'stroke="#c9a84c" stroke-width="1" opacity="0.6"/>'
-        f'<text x="{IMG_SIZE//2}" y="{int(IMG_SIZE*0.68)}" text-anchor="middle" '
-        f'font-family="Georgia,serif" font-size="{int(IMG_SIZE*0.45)}" '
-        f'font-weight="700" fill="#e8c96d">{letter}</text>'
-        f'</svg>'
-    )
-    return svg.encode()
+    hex_color = avatar_color(name)
+
+    # Parse hex colour → RGB tuple
+    h = hex_color.lstrip("#")
+    top_rgb    = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+    bottom_rgb = (10, 10, 15)   # #0a0a0f
+    gold_rgb   = (232, 201, 109) # #e8c96d
+    border_rgb = (201, 168, 76)  # #c9a84c
+
+    size = IMG_SIZE
+
+    # ── Draw gradient background ──────────────────────────────────────────
+    img  = Image.new("RGB", (size, size))
+    draw = ImageDraw.Draw(img)
+
+    for y in range(size):
+        t = y / (size - 1)
+        r = int(top_rgb[0] + (bottom_rgb[0] - top_rgb[0]) * t)
+        g = int(top_rgb[1] + (bottom_rgb[1] - top_rgb[1]) * t)
+        b = int(top_rgb[2] + (bottom_rgb[2] - top_rgb[2]) * t)
+        draw.line([(0, y), (size, y)], fill=(r, g, b))
+
+    # ── Rounded-rect mask (rx=12) ────────────────────────────────────────
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, size - 1, size - 1],
+                                           radius=12, fill=255)
+    img.putalpha(mask)
+
+    # ── Gold border ───────────────────────────────────────────────────────
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle([0, 0, size - 1, size - 1],
+                           radius=12, outline=border_rgb + (153,), width=1)
+
+    # ── Letter ────────────────────────────────────────────────────────────
+    font_size = int(size * 0.50)
+    font = None
+    for path in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSerifBold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ]:
+        try:
+            font = ImageFont.truetype(path, font_size)
+            break
+        except Exception:
+            continue
+
+    if font is None:
+        font = ImageFont.load_default()
+
+    bbox = draw.textbbox((0, 0), letter, font=font)
+    tw   = bbox[2] - bbox[0]
+    th   = bbox[3] - bbox[1]
+    tx   = (size - tw) // 2 - bbox[0]
+    ty   = (size - th) // 2 - bbox[1]
+    draw.text((tx, ty), letter, font=font, fill=gold_rgb)
+
+    # ── Export as PNG ─────────────────────────────────────────────────────
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def stock_level(qty: float) -> str:
@@ -622,16 +675,18 @@ def send_email(
     msg_alt.attach(MIMEText(html, "html"))
     msg_related.attach(msg_alt)
 
-    # One inline image part per UNIQUE image hash — no duplicates
+    # One inline image part per UNIQUE image hash — no duplicates, no SVG
     for img_hash, img_bytes in unique_images.items():
         try:
-            if img_bytes[:4] == b"<svg":
-                img_part = MIMEImage(img_bytes, _subtype="svg+xml")
+            # Sniff format: JPEG starts FF D8, PNG starts 89 50 4E 47
+            if img_bytes[:2] == b"\xff\xd8":
+                subtype = "jpeg"
             else:
-                img_part = MIMEImage(img_bytes)
+                subtype = "png"
+            img_part = MIMEImage(img_bytes, _subtype=subtype)
             img_part.add_header("Content-ID",          f"<{img_hash}>")
             img_part.add_header("Content-Disposition", "inline",
-                                filename=f"{img_hash}.img")
+                                filename=f"{img_hash}.{subtype}")
             msg_related.attach(img_part)
         except Exception as e:
             print(f"   ⚠️  Could not attach image {img_hash[:8]}…: {e}", flush=True)
@@ -722,7 +777,7 @@ for p in all_products:
     if not img_bytes:
         # Letter-avatar: one per unique product name (avatars are cheap to dupe in bytes
         # but we still dedup them via hash)
-        img_bytes = letter_avatar_svg_bytes(p["name"] or "?")
+        img_bytes = letter_avatar_png_bytes(p["name"] or "?")
 
     h = hashlib.md5(img_bytes).hexdigest()
     if h not in hash_to_bytes:
