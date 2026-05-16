@@ -35,11 +35,11 @@ QTY_FIELD_CANDIDATES = [
     "qty_available",
 ]
 
-# Field that marks a product as imported (boolean True/False in Odoo)
-# Adjust this to your actual custom field name
-IMPORTED_FIELD = None   # set to e.g. "x_is_imported" to send two separate emails
+# Set to your Odoo boolean field name to send two separate emails,
+# or leave as None for a single combined email.
+IMPORTED_FIELD = None
 
-# Deterministic colour palette — used when a product has NO image in Odoo
+# Deterministic colour palette for letter avatars
 AVATAR_COLORS = [
     "#1d4ed8", "#0369a1", "#047857", "#7c3aed",
     "#b45309", "#be123c", "#0e7490", "#15803d",
@@ -58,11 +58,8 @@ def avatar_color(name: str) -> str:
     return AVATAR_COLORS[idx]
 
 
-def letter_avatar_b64_uri(name: str) -> str:
-    """
-    Returns a tiny inline SVG as a data URI — no attachment needed.
-    This replaces the old letter_avatar_html() approach.
-    """
+def letter_avatar_uri(name: str) -> str:
+    """Inline SVG data URI — zero email attachments."""
     letter = (name or "?")[0].upper()
     color  = avatar_color(name)
     svg = (
@@ -78,80 +75,202 @@ def letter_avatar_b64_uri(name: str) -> str:
 
 
 def img_to_data_uri(img_bytes: bytes) -> str:
-    """Convert raw image bytes to an inline base64 data URI (PNG assumed)."""
     b64 = base64.b64encode(img_bytes).decode()
     return f"data:image/png;base64,{b64}"
+
+
+def stock_level(qty: float) -> str:
+    if qty == 0:  return "out"
+    if qty <= 2:  return "critical"
+    return "low"
 
 
 def stock_badge(qty: float) -> str:
     if qty == 0:
         return (
-            '<span style="background:#1a0005;color:#ff4d6d;padding:4px 12px;'
-            'border-radius:20px;font-weight:700;font-size:13px;'
-            'letter-spacing:0.5px;">OUT</span>'
+            '<span style="background:#3d0010;color:#ff4d6d;padding:3px 11px;'
+            'border-radius:20px;font-weight:700;font-size:12px;'
+            'letter-spacing:0.5px;white-space:nowrap;">OUT OF STOCK</span>'
         )
     elif qty <= 2:
         return (
-            f'<span style="background:#1c0a00;color:#ff8c42;padding:4px 12px;'
-            f'border-radius:20px;font-weight:700;font-size:13px;">{qty:g}</span>'
+            f'<span style="background:#3d1a00;color:#ff8c42;padding:3px 11px;'
+            f'border-radius:20px;font-weight:700;font-size:12px;'
+            f'white-space:nowrap;">{qty:g} left</span>'
         )
     else:
         return (
-            f'<span style="background:#0a1a10;color:#52c41a;padding:4px 12px;'
-            f'border-radius:20px;font-weight:700;font-size:13px;">{qty:g}</span>'
+            f'<span style="background:#0a2410;color:#52c41a;padding:3px 11px;'
+            f'border-radius:20px;font-weight:700;font-size:12px;'
+            f'white-space:nowrap;">{qty:g} in stock</span>'
         )
 
 
+def esc(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
 # ─────────────────────────────────────────────
-#  HTML BUILDER
-#  ✅ Images are now inline data URIs — ZERO attachments, zero gallery mess.
-#  ✅ Sortable/filterable dropdowns on Name, Category, Stock columns.
+#  HTML BUILDER  —  100% Gmail-safe, zero JS
+#
+#  WHY no dropdowns/JS:
+#    Gmail (web + Android + iOS) strips ALL <script> tags and most
+#    interactive CSS selectors (:checked, :target, etc.).
+#    The only reliable interactivity in Gmail is clicking links.
+#
+#  What we do instead:
+#    • Products pre-grouped into 3 colour-coded sections:
+#        🔴 Out of Stock  →  🟠 Critical (1-2)  →  🟡 Low (3-4)
+#    • Within each section, products grouped by category with a
+#      visible header — readers can scan visually.
+#    • A "Product Name Index" at the bottom lists every product name
+#      in plain text — fully Ctrl-F / Find-in-page searchable.
+#    • A tip banner explains how to search on desktop & mobile.
 # ─────────────────────────────────────────────
 def build_html(
     products: list,
     qty_field: str,
-    product_data_uris: dict,   # p_id → data URI string
+    product_data_uris: dict,
     label: str,
     total_products: int,
     total_categories: int,
     critical_count: int,
     low_count: int,
 ) -> str:
-    generated_at = utc_now().strftime("%d %b %Y • %H:%M UTC")
 
-    # Collect unique category names for the dropdown
-    cat_names = sorted({
-        (p["categ_id"][1] if p.get("categ_id") else "Uncategorised")
-        for p in products
-    })
+    generated_at = utc_now().strftime("%d %b %Y %H:%M UTC")
 
-    # Build the JS data array — each product as a JS object literal
-    js_rows = []
+    # Group by stock level, then category
+    by_level: dict[str, dict[str, list]] = {
+        "out":      defaultdict(list),
+        "critical": defaultdict(list),
+        "low":      defaultdict(list),
+    }
     for p in products:
-        p_id     = p["id"]
-        qty      = float(p.get(qty_field) or 0)
-        cat_name = p["categ_id"][1] if p.get("categ_id") else "Uncategorised"
-        name     = (p["name"] or "").replace("\\", "\\\\").replace("`", "\\`").replace("'", "\\'")
-        cat_esc  = cat_name.replace("\\", "\\\\").replace("'", "\\'")
-        uri      = product_data_uris.get(p_id, "")
-        js_rows.append(
-            f"{{id:{p_id},name:'{name}',cat:'{cat_esc}',qty:{qty},uri:`{uri}`}}"
-        )
+        qty = float(p.get(qty_field) or 0)
+        cat = p["categ_id"][1] if p.get("categ_id") else "Uncategorised"
+        by_level[stock_level(qty)][cat].append(p)
 
-    js_data = ",\n    ".join(js_rows)
+    level_meta = {
+        "out":      ("OUT OF STOCK",      "#ff4d6d", "#3d0010", "#ff4d6d44"),
+        "critical": ("CRITICAL (1-2 units)", "#ff8c42", "#3d1a00", "#ff8c4244"),
+        "low":      ("LOW STOCK (3-4 units)", "#52c41a", "#0a2410", "#52c41a33"),
+    }
 
-    # Category <option> tags
-    cat_options = "\n".join(
-        f'<option value="{c}">{c}</option>' for c in cat_names
+    sections_html = ""
+
+    for lvl, (lvl_title, text_col, bg_col, border_col) in level_meta.items():
+        cats = by_level[lvl]
+        if not cats:
+            continue
+
+        lvl_count = sum(len(v) for v in cats.values())
+
+        # Level header row
+        sections_html += f"""
+        <tr>
+          <td colspan="3" style="padding:20px 16px 8px 16px;">
+            <table width="100%" cellpadding="0" cellspacing="0">
+              <tr>
+                <td style="background:{bg_col};border:1px solid {border_col};
+                           border-radius:8px;padding:9px 16px;">
+                  <table width="100%" cellpadding="0" cellspacing="0"><tr>
+                    <td style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                               font-size:13px;font-weight:700;color:{text_col};
+                               letter-spacing:0.5px;">
+                      {lvl_title}
+                    </td>
+                    <td align="right"
+                        style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                               font-size:12px;color:{text_col};">
+                      {lvl_count} product{'s' if lvl_count != 1 else ''}
+                    </td>
+                  </tr></table>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>"""
+
+        for cat_name in sorted(cats.keys()):
+            cat_products = sorted(cats[cat_name], key=lambda p: (p["name"] or "").lower())
+
+            # Category sub-header
+            sections_html += f"""
+        <tr>
+          <td colspan="3" style="padding:8px 16px 2px 16px;">
+            <div style="background:#0f172a;border:1px solid #1e293b;
+                        border-radius:6px;padding:5px 12px;">
+              <span style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                           font-size:10px;font-weight:700;letter-spacing:1.5px;
+                           text-transform:uppercase;color:#64748b;">
+                {esc(cat_name)}
+              </span>
+              <span style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                           font-size:10px;color:#334155;margin-left:8px;">
+                {len(cat_products)} item{'s' if len(cat_products) != 1 else ''}
+              </span>
+            </div>
+          </td>
+        </tr>"""
+
+            for p in cat_products:
+                qty   = float(p.get(qty_field) or 0)
+                uri   = product_data_uris.get(p["id"], "")
+                badge = stock_badge(qty)
+                name  = esc(p["name"] or "—")
+
+                if uri:
+                    img_tag = (
+                        f'<img src="{uri}" width="40" height="40" '
+                        f'style="width:40px;height:40px;border-radius:8px;'
+                        f'object-fit:cover;display:block;border:0;" alt="">'
+                    )
+                else:
+                    av_uri = letter_avatar_uri(p["name"] or "?")
+                    img_tag = (
+                        f'<img src="{av_uri}" width="40" height="40" '
+                        f'style="width:40px;height:40px;border-radius:8px;'
+                        f'display:block;border:0;" alt="">'
+                    )
+
+                sections_html += f"""
+        <tr style="background:#0a1628;">
+          <td width="56" style="padding:9px 4px 9px 16px;
+                                vertical-align:middle;text-align:center;">
+            {img_tag}
+          </td>
+          <td style="padding:9px 8px;font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                     font-size:13px;color:#e2e8f0;font-weight:500;
+                     vertical-align:middle;word-break:break-word;">
+            {name}
+          </td>
+          <td style="padding:9px 16px 9px 8px;text-align:right;
+                     vertical-align:middle;white-space:nowrap;">
+            {badge}
+          </td>
+        </tr>
+        <tr>
+          <td colspan="3" style="padding:0;height:1px;font-size:1px;
+              background:#111827;">&nbsp;</td>
+        </tr>"""
+
+    # Product name index for Ctrl-F searching
+    all_names = sorted({(p["name"] or "").strip() for p in products}, key=str.lower)
+    MAX_INDEX = 100
+    shown     = all_names[:MAX_INDEX]
+    overflow  = len(all_names) - MAX_INDEX
+
+    index_items = " &nbsp;·&nbsp; ".join(
+        f'<span style="font-family:\'Segoe UI\',Helvetica,Arial,sans-serif;'
+        f'font-size:11px;color:#64748b;">{esc(n)}</span>'
+        for n in shown
     )
-
-    # Stock level options
-    stock_options = """
-      <option value="all">All</option>
-      <option value="out">Out of Stock (0)</option>
-      <option value="critical">Critical (1–2)</option>
-      <option value="low">Low (3–4)</option>
-    """
+    overflow_note = (
+        f'<div style="font-family:\'Segoe UI\',Helvetica,Arial,sans-serif;'
+        f'font-size:11px;color:#334155;margin-top:6px;">'
+        f'… and {overflow} more products not shown here.</div>'
+    ) if overflow > 0 else ""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -161,175 +280,164 @@ def build_html(
   <title>Low Stock Alert</title>
 </head>
 <body style="margin:0;padding:0;background:#060b14;">
-
 <table width="100%" cellpadding="0" cellspacing="0"
-       style="background:#060b14;padding:32px 12px;">
+       style="background:#060b14;padding:24px 8px;">
   <tr><td align="center">
-  <table width="680" cellpadding="0" cellspacing="0"
-         style="max-width:680px;width:100%;">
+  <table width="640" cellpadding="0" cellspacing="0"
+         style="max-width:640px;width:100%;">
 
     <!-- HEADER -->
     <tr>
       <td style="background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);
                  border-radius:16px 16px 0 0;border:1px solid #1e3a5f;
-                 padding:36px 32px 28px;">
+                 padding:28px 24px 20px;">
         <table width="100%" cellpadding="0" cellspacing="0"><tr>
           <td>
             <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:11px;font-weight:700;letter-spacing:3px;
-                        text-transform:uppercase;color:#38bdf8;margin-bottom:10px;">
+                        font-size:10px;font-weight:700;letter-spacing:3px;
+                        text-transform:uppercase;color:#38bdf8;margin-bottom:8px;">
               ◈ &nbsp;INVENTORY MANAGEMENT SYSTEM
             </div>
             <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:26px;font-weight:700;color:#f1f5f9;
+                        font-size:22px;font-weight:700;color:#f1f5f9;
                         line-height:1.2;margin-bottom:6px;">
-              Low Stock Alert &nbsp;
-              <span style="font-size:16px;color:#475569;font-weight:400;">
-                {label}
-              </span>
+              Low Stock Alert{"&nbsp;<span style='font-size:14px;color:#475569;font-weight:400;'>" + label + "</span>" if label else ""}
             </div>
             <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:13px;color:#64748b;">
+                        font-size:11px;color:#64748b;">
               {generated_at}
-              &nbsp;·&nbsp; Threshold: &lt;&nbsp;{LOW_STOCK_THRESHOLD} units
-              &nbsp;·&nbsp; Field:
-              <code style="color:#94a3b8;font-size:12px;">{qty_field}</code>
+              &nbsp;·&nbsp; Threshold &lt; {LOW_STOCK_THRESHOLD}
+              &nbsp;·&nbsp; <code style="color:#94a3b8;font-size:10px;">{qty_field}</code>
             </div>
           </td>
-          <td align="right" valign="top">
+          <td align="right" valign="top" width="56">
             <div style="background:#ff4d6d22;border:1px solid #ff4d6d55;
-                        border-radius:50%;width:52px;height:52px;
-                        text-align:center;line-height:52px;font-size:24px;">⚠</div>
+                        border-radius:50%;width:44px;height:44px;
+                        text-align:center;line-height:44px;font-size:20px;">⚠</div>
           </td>
         </tr></table>
       </td>
     </tr>
 
-    <!-- METRICS STRIP -->
+    <!-- METRICS -->
     <tr>
       <td style="background:#0d1929;border-left:1px solid #1e3a5f;
                  border-right:1px solid #1e3a5f;">
         <table width="100%" cellpadding="0" cellspacing="0"><tr>
-          <td width="33%" style="padding:20px 0;text-align:center;
+          <td width="33%" style="padding:16px 0;text-align:center;
                                   border-right:1px solid #1e293b;">
             <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:30px;font-weight:800;color:#f1f5f9;line-height:1;">
+                        font-size:26px;font-weight:800;color:#f1f5f9;line-height:1;">
               {total_products}</div>
             <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:11px;color:#475569;margin-top:4px;
-                        text-transform:uppercase;letter-spacing:1px;">Total Products</div>
+                        font-size:9px;color:#475569;margin-top:4px;
+                        text-transform:uppercase;letter-spacing:1px;">Products</div>
           </td>
-          <td width="33%" style="padding:20px 0;text-align:center;
+          <td width="33%" style="padding:16px 0;text-align:center;
                                   border-right:1px solid #1e293b;">
             <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:30px;font-weight:800;color:#f1f5f9;line-height:1;">
+                        font-size:26px;font-weight:800;color:#f1f5f9;line-height:1;">
               {total_categories}</div>
             <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:11px;color:#475569;margin-top:4px;
+                        font-size:9px;color:#475569;margin-top:4px;
                         text-transform:uppercase;letter-spacing:1px;">Categories</div>
           </td>
-          <td width="34%" style="padding:20px 0;text-align:center;">
+          <td width="34%" style="padding:16px 0;text-align:center;">
             <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:30px;font-weight:800;color:#ff4d6d;line-height:1;">
+                        font-size:26px;font-weight:800;color:#ff4d6d;line-height:1;">
               {critical_count}</div>
             <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                        font-size:11px;color:#475569;margin-top:4px;
+                        font-size:9px;color:#475569;margin-top:4px;
                         text-transform:uppercase;letter-spacing:1px;">Out of Stock</div>
           </td>
         </tr></table>
       </td>
     </tr>
 
-    <!-- FILTER BAR -->
+    <!-- SEARCH TIP -->
     <tr>
-      <td style="background:#080f1e;border-left:1px solid #1e3a5f;
-                 border-right:1px solid #1e3a5f;border-top:1px solid #1e293b;
-                 padding:14px 20px;">
+      <td style="background:#08111f;border-left:1px solid #1e3a5f;
+                 border-right:1px solid #1e3a5f;border-top:1px solid #0f1e35;
+                 padding:10px 16px;">
         <table width="100%" cellpadding="0" cellspacing="0"><tr>
-          <!-- Name search -->
-          <td style="padding-right:8px;">
-            <input id="filterName" type="text" placeholder="🔍 Search name…"
-              oninput="renderTable()"
-              style="width:100%;box-sizing:border-box;background:#0f172a;
-                     border:1px solid #1e3a5f;border-radius:8px;
-                     padding:8px 12px;color:#e2e8f0;
-                     font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                     font-size:13px;outline:none;">
-          </td>
-          <!-- Category dropdown -->
-          <td style="padding-right:8px;white-space:nowrap;">
-            <select id="filterCat" onchange="renderTable()"
-              style="background:#0f172a;border:1px solid #1e3a5f;
-                     border-radius:8px;padding:8px 12px;color:#94a3b8;
-                     font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                     font-size:13px;outline:none;cursor:pointer;">
-              <option value="all">All Categories</option>
-              {cat_options}
-            </select>
-          </td>
-          <!-- Stock dropdown -->
-          <td style="white-space:nowrap;">
-            <select id="filterStock" onchange="renderTable()"
-              style="background:#0f172a;border:1px solid #1e3a5f;
-                     border-radius:8px;padding:8px 12px;color:#94a3b8;
-                     font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                     font-size:13px;outline:none;cursor:pointer;">
-              {stock_options}
-            </select>
+          <td style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                     font-size:11px;color:#475569;line-height:1.6;">
+            💡 <strong style="color:#64748b;">Search by name:</strong>
+            &nbsp;Desktop — press
+            <span style="background:#0f172a;color:#94a3b8;padding:1px 6px;
+                         border-radius:4px;font-family:monospace;font-size:10px;">Ctrl+F</span>
+            &nbsp;· Mobile — tap
+            <span style="background:#0f172a;color:#94a3b8;padding:1px 6px;
+                         border-radius:4px;font-size:10px;">⋮ → Find in page</span>
+            &nbsp;· All names are listed at the bottom of this email.
           </td>
         </tr></table>
       </td>
     </tr>
 
-    <!-- PRODUCT TABLE (rendered by JS) -->
+    <!-- COLUMN HEADERS -->
     <tr>
-      <td style="background:#0a1628;border-left:1px solid #1e3a5f;
-                 border-right:1px solid #1e3a5f;border-top:1px solid #1e293b;">
+      <td style="background:#060e1c;border-left:1px solid #1e3a5f;
+                 border-right:1px solid #1e3a5f;border-top:1px solid #0f1e35;">
         <table width="100%" cellpadding="0" cellspacing="0">
-          <tr style="background:#080f1e;">
-            <th width="56" style="padding:12px 16px;text-align:center;
-                font-family:'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;
+          <tr style="background:#04080f;">
+            <th width="56" style="padding:8px 4px 8px 16px;text-align:center;
+                font-family:'Segoe UI',Helvetica,Arial,sans-serif;font-size:9px;
                 font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
-                color:#334155;">IMG</th>
-            <th style="padding:12px 8px;text-align:left;cursor:pointer;
-                font-family:'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;
+                color:#1e3a5f;">IMG</th>
+            <th style="padding:8px;text-align:left;
+                font-family:'Segoe UI',Helvetica,Arial,sans-serif;font-size:9px;
                 font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
-                color:#334155;" onclick="toggleSort('name')">
-              Product <span id="sortName"></span></th>
-            <th width="130" style="padding:12px 8px;text-align:left;cursor:pointer;
-                font-family:'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;
+                color:#1e3a5f;">Product Name</th>
+            <th style="padding:8px 16px 8px 8px;text-align:right;
+                font-family:'Segoe UI',Helvetica,Arial,sans-serif;font-size:9px;
                 font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
-                color:#334155;" onclick="toggleSort('cat')">
-              Category <span id="sortCat"></span></th>
-            <th width="100" style="padding:12px 16px;text-align:center;cursor:pointer;
-                font-family:'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;
-                font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
-                color:#334155;" onclick="toggleSort('qty')">
-              In Stock <span id="sortQty"></span></th>
+                color:#1e3a5f;">In Stock</th>
           </tr>
-          <tbody id="productBody"></tbody>
         </table>
-        <div id="noResults" style="display:none;text-align:center;
-             padding:32px;font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-             font-size:14px;color:#334155;">
-          No products match the current filters.
+      </td>
+    </tr>
+
+    <!-- PRODUCT ROWS (pre-rendered, grouped by level → category) -->
+    <tr>
+      <td style="background:#060e1c;border-left:1px solid #1e3a5f;
+                 border-right:1px solid #1e3a5f;">
+        <table width="100%" cellpadding="0" cellspacing="0">
+          {sections_html}
+          <!-- bottom padding row -->
+          <tr><td colspan="3" style="height:16px;"></td></tr>
+        </table>
+      </td>
+    </tr>
+
+    <!-- PRODUCT NAME INDEX (plain text, Ctrl-F searchable) -->
+    <tr>
+      <td style="background:#04080f;border-left:1px solid #1e3a5f;
+                 border-right:1px solid #1e3a5f;border-top:1px solid #0f1e35;
+                 padding:14px 16px;">
+        <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                    font-size:9px;font-weight:700;letter-spacing:1.5px;
+                    text-transform:uppercase;color:#1e3a5f;margin-bottom:8px;">
+          ▸ Product Name Index — press Ctrl+F to search
         </div>
+        <div style="line-height:2.2;">{index_items}</div>
+        {overflow_note}
       </td>
     </tr>
 
     <!-- FOOTER -->
     <tr>
-      <td style="background:#080f1e;border:1px solid #1e3a5f;
-                 border-top:1px solid #1e293b;border-radius:0 0 16px 16px;
-                 padding:20px 32px;">
+      <td style="background:#04080f;border:1px solid #1e3a5f;
+                 border-top:1px solid #0f1e35;border-radius:0 0 16px 16px;
+                 padding:14px 24px;">
         <table width="100%" cellpadding="0" cellspacing="0"><tr>
           <td style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                     font-size:11px;color:#334155;">
-            Auto-generated by Inventory Alert System
+                     font-size:10px;color:#1e3a5f;">
+            Auto-generated · Inventory Alert System
           </td>
           <td align="right"
               style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                     font-size:11px;color:#334155;">
+                     font-size:10px;color:#1e3a5f;">
             {low_count} low &nbsp;·&nbsp;
             <span style="color:#ff4d6d;">{critical_count} out</span>
           </td>
@@ -340,144 +448,12 @@ def build_html(
   </table>
   </td></tr>
 </table>
-
-<!-- ── INTERACTIVE LOGIC ─────────────────────────────────────────── -->
-<script>
-  const ALL_PRODUCTS = [
-    {js_data}
-  ];
-
-  let sortKey = null;
-  let sortAsc = true;
-
-  function stockLevel(qty) {{
-    if (qty === 0)   return 'out';
-    if (qty <= 2)    return 'critical';
-    return 'low';
-  }}
-
-  function badgeHtml(qty) {{
-    if (qty === 0)
-      return '<span style="background:#1a0005;color:#ff4d6d;padding:4px 12px;border-radius:20px;font-weight:700;font-size:13px;letter-spacing:0.5px;">OUT</span>';
-    const col = qty <= 2 ? '#ff8c42' : '#52c41a';
-    const bg  = qty <= 2 ? '#1c0a00' : '#0a1a10';
-    return `<span style="background:${{bg}};color:${{col}};padding:4px 12px;border-radius:20px;font-weight:700;font-size:13px;">${{qty}}</span>`;
-  }}
-
-  function imgHtml(uri, name) {{
-    if (uri) {{
-      return `<div style="width:44px;height:44px;border-radius:10px;overflow:hidden;background:#1e2433;display:inline-block;"><img src="${{uri}}" width="44" height="44" style="width:44px;height:44px;object-fit:cover;display:block;" alt=""></div>`;
-    }}
-    // no image — inline SVG avatar
-    const colors=['#1d4ed8','#0369a1','#047857','#7c3aed','#b45309','#be123c','#0e7490','#15803d'];
-    let h=0; for(const c of name){{h=(h*31+c.charCodeAt(0))>>>0;}} const col=colors[h%colors.length];
-    const letter=(name||'?')[0].toUpperCase();
-    return `<div style="width:44px;height:44px;border-radius:10px;background:${{col}};display:inline-block;text-align:center;line-height:44px;font-family:Helvetica,Arial,sans-serif;font-size:18px;font-weight:700;color:#fff;">${{letter}}</div>`;
-  }}
-
-  function renderTable() {{
-    const nameQ  = document.getElementById('filterName').value.toLowerCase();
-    const catQ   = document.getElementById('filterCat').value;
-    const stockQ = document.getElementById('filterStock').value;
-
-    let rows = ALL_PRODUCTS.filter(p => {{
-      if (nameQ  && !p.name.toLowerCase().includes(nameQ)) return false;
-      if (catQ  !== 'all' && p.cat !== catQ)               return false;
-      if (stockQ !== 'all' && stockLevel(p.qty) !== stockQ) return false;
-      return true;
-    }});
-
-    if (sortKey) {{
-      rows.sort((a, b) => {{
-        let av = a[sortKey], bv = b[sortKey];
-        if (typeof av === 'string') av = av.toLowerCase();
-        if (typeof bv === 'string') bv = bv.toLowerCase();
-        return sortAsc ? (av < bv ? -1 : av > bv ? 1 : 0)
-                       : (av > bv ? -1 : av < bv ? 1 : 0);
-      }});
-    }}
-
-    const tbody = document.getElementById('productBody');
-    const noRes = document.getElementById('noResults');
-
-    if (rows.length === 0) {{
-      tbody.innerHTML = '';
-      noRes.style.display = 'block';
-      return;
-    }}
-    noRes.style.display = 'none';
-
-    // Group by category
-    const groups = {{}};
-    for (const p of rows) {{
-      (groups[p.cat] = groups[p.cat] || []).push(p);
-    }}
-
-    let html = '';
-    for (const [cat, items] of Object.entries(groups)) {{
-      html += `
-        <tr>
-          <td colspan="4" style="padding:24px 20px 8px;">
-            <div style="display:inline-block;background:#0f172a;border:1px solid #334155;
-                        border-radius:6px;padding:4px 14px;">
-              <span style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                           font-size:11px;font-weight:700;letter-spacing:1.5px;
-                           text-transform:uppercase;color:#94a3b8;">${{cat}}</span>
-              <span style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                           font-size:11px;color:#475569;margin-left:8px;">
-                ${{items.length}} item${{items.length !== 1 ? 's' : ''}}
-              </span>
-            </div>
-          </td>
-        </tr>`;
-      for (const p of items) {{
-        html += `
-          <tr>
-            <td style="padding:12px 16px;width:56px;text-align:center;vertical-align:middle;">
-              ${{imgHtml(p.uri, p.name)}}
-            </td>
-            <td style="padding:12px 8px;font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                       font-size:14px;color:#e2e8f0;font-weight:500;vertical-align:middle;">
-              ${{p.name}}
-            </td>
-            <td style="padding:12px 8px;font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                       font-size:12px;color:#64748b;vertical-align:middle;">
-              ${{p.cat}}
-            </td>
-            <td style="padding:12px 16px;text-align:center;vertical-align:middle;">
-              ${{badgeHtml(p.qty)}}
-            </td>
-          </tr>
-          <tr>
-            <td colspan="4" style="padding:0;height:1px;
-                background:linear-gradient(90deg,transparent,#2d3748 20%,#2d3748 80%,transparent);">
-            </td>
-          </tr>`;
-      }}
-    }}
-    tbody.innerHTML = html;
-  }}
-
-  function toggleSort(key) {{
-    if (sortKey === key) {{ sortAsc = !sortAsc; }}
-    else {{ sortKey = key; sortAsc = true; }}
-    ['name','cat','qty'].forEach(k => {{
-      document.getElementById('sort'+k.charAt(0).toUpperCase()+k.slice(1)).textContent =
-        sortKey === k ? (sortAsc ? ' ▲' : ' ▼') : '';
-    }});
-    renderTable();
-  }}
-
-  // Initial render
-  renderTable();
-</script>
-
 </body>
 </html>"""
 
 
 # ─────────────────────────────────────────────
-#  SEND EMAIL  (plain multipart/related, NO image attachments)
+#  SEND — zero attachments
 # ─────────────────────────────────────────────
 def send_email(html: str, subject: str) -> None:
     msg = MIMEMultipart("alternative")
@@ -485,7 +461,6 @@ def send_email(html: str, subject: str) -> None:
     msg["From"]    = SMTP_FROM
     msg["To"]      = SMTP_TO
     msg.attach(MIMEText(html, "html"))
-
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
         server.ehlo()
         server.starttls()
@@ -494,30 +469,28 @@ def send_email(html: str, subject: str) -> None:
 
 
 # ─────────────────────────────────────────────
-#  1. CONNECT TO ODOO
+#  1. CONNECT
 # ─────────────────────────────────────────────
 print("🔌 Connecting to Odoo...", flush=True)
 common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
 uid    = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
 if not uid:
     raise Exception("❌ Odoo authentication failed")
-
 models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 print("✅ Connected to Odoo", flush=True)
 
 
 # ─────────────────────────────────────────────
-#  2. AUTO-DETECT QUANTITY FIELD & FETCH PRODUCTS
+#  2. DETECT QTY FIELD + FETCH
 # ─────────────────────────────────────────────
 print("🔍 Detecting quantity field...", flush=True)
 
 all_products = None
 qty_field    = None
 
-# Decide which extra fields to pull
-extra_fields = ["id", "name", "categ_id", "image_512"]
+base_fields = ["id", "name", "categ_id", "image_512"]
 if IMPORTED_FIELD:
-    extra_fields.append(IMPORTED_FIELD)
+    base_fields.append(IMPORTED_FIELD)
 
 for candidate in QTY_FIELD_CANDIDATES:
     try:
@@ -525,12 +498,8 @@ for candidate in QTY_FIELD_CANDIDATES:
         result = models.execute_kw(
             ODOO_DB, uid, ODOO_PASSWORD,
             "product.product", "search_read",
-            [[
-                ("active",  "=", True),
-                (candidate, "<", LOW_STOCK_THRESHOLD),
-                (candidate, ">=", 0),
-            ]],
-            {"fields": extra_fields + [candidate], "limit": 0},
+            [[("active", "=", True), (candidate, "<", LOW_STOCK_THRESHOLD), (candidate, ">=", 0)]],
+            {"fields": base_fields + [candidate], "limit": 0},
         )
         all_products = result
         qty_field    = candidate
@@ -543,7 +512,6 @@ if all_products is None or qty_field is None:
     print("❌ None of the quantity fields worked. Aborting.", flush=True)
     sys.exit(1)
 
-# Safety filter
 all_products = [
     p for p in all_products
     if p.get(qty_field) not in (None, False)
@@ -568,64 +536,49 @@ all_products.sort(key=lambda p: (
 
 
 # ─────────────────────────────────────────────
-#  4. DECODE IMAGES → DATA URIs  (no attachments)
+#  4. IMAGES → DATA URIs
 # ─────────────────────────────────────────────
-print("🖼️  Converting images to data URIs...", flush=True)
+print("🖼️  Converting images to inline data URIs...", flush=True)
 
-# Deduplicate: bytes hash → data URI, then map p_id → data URI
-hash_to_uri:      dict[str, str]      = {}
-product_data_uris: dict[int, str]     = {}
+hash_to_uri:       dict[str, str] = {}
+product_data_uris: dict[int, str] = {}
 
 for p in all_products:
     p_id    = p["id"]
     raw_img = p.get("image_512")
     try:
         if raw_img and str(raw_img) != "False":
-            img_str   = raw_img.decode("utf-8") if isinstance(raw_img, bytes) else str(raw_img)
-            img_str   = img_str.replace("\n", "").replace("\r", "").strip()
-            img_bytes = base64.b64decode(img_str)
-            img_hash  = hashlib.md5(img_bytes).hexdigest()
-            if img_hash not in hash_to_uri:
-                hash_to_uri[img_hash] = img_to_data_uri(img_bytes)
-            product_data_uris[p_id] = hash_to_uri[img_hash]
+            s = raw_img.decode("utf-8") if isinstance(raw_img, bytes) else str(raw_img)
+            s = s.replace("\n", "").replace("\r", "").strip()
+            b = base64.b64decode(s)
+            h = hashlib.md5(b).hexdigest()
+            if h not in hash_to_uri:
+                hash_to_uri[h] = img_to_data_uri(b)
+            product_data_uris[p_id] = hash_to_uri[h]
         else:
-            product_data_uris[p_id] = ""    # JS will render a letter avatar
+            product_data_uris[p_id] = ""
     except Exception as exc:
         print(f"   ⚠️  Bad image for product {p_id}: {exc}", flush=True)
         product_data_uris[p_id] = ""
 
-print(
-    f"   ↳ {len(all_products)} products → {len(hash_to_uri)} unique image(s).",
-    flush=True,
-)
+print(f"   ↳ {len(all_products)} products → {len(hash_to_uri)} unique image(s).", flush=True)
 
 
 # ─────────────────────────────────────────────
-#  5. SPLIT INTO IMPORTED / NON-IMPORTED
+#  5. SPLIT (optional)
 # ─────────────────────────────────────────────
-def split_products(products):
-    if not IMPORTED_FIELD:
-        return None, products   # feature disabled → send everything as "non-imported"
-
-    imported     = [p for p in products if p.get(IMPORTED_FIELD)]
-    non_imported = [p for p in products if not p.get(IMPORTED_FIELD)]
-    return imported, non_imported
-
-
-imported_products, non_imported_products = split_products(all_products)
-
-groups = []
 if IMPORTED_FIELD:
-    if imported_products:
-        groups.append(("Imported",     imported_products))
-    if non_imported_products:
-        groups.append(("Non-Imported", non_imported_products))
+    groups = []
+    imported     = [p for p in all_products if p.get(IMPORTED_FIELD)]
+    non_imported = [p for p in all_products if not p.get(IMPORTED_FIELD)]
+    if imported:     groups.append(("Imported",     imported))
+    if non_imported: groups.append(("Non-Imported", non_imported))
 else:
-    groups.append(("", non_imported_products))  # single email, no label
+    groups = [("", all_products)]
 
 
 # ─────────────────────────────────────────────
-#  6. BUILD & SEND ONE EMAIL PER GROUP
+#  6. BUILD & SEND
 # ─────────────────────────────────────────────
 print(f"📤 Sending to {SMTP_TO}...", flush=True)
 
@@ -634,32 +587,27 @@ for group_label, products in groups:
     total_categories = len({p["categ_id"][0] for p in products if p.get("categ_id")})
     critical_count   = sum(1 for p in products if float(p.get(qty_field) or 0) == 0)
     low_count        = total_products - critical_count
-
-    label_str = f"[{group_label}]" if group_label else ""
+    label_str        = f"[{group_label}]" if group_label else ""
 
     subject = (
         f"⚠️ Low Stock Alert {label_str}"
         f" — {total_products} product{'s' if total_products != 1 else ''}"
         f" · {critical_count} out of stock"
         f" · {utc_now().strftime('%d %b %Y')}"
-    )
+    ).strip()
 
     html = build_html(
-        products          = products,
-        qty_field         = qty_field,
-        product_data_uris = product_data_uris,
-        label             = label_str,
-        total_products    = total_products,
-        total_categories  = total_categories,
-        critical_count    = critical_count,
-        low_count         = low_count,
+        products=products, qty_field=qty_field,
+        product_data_uris=product_data_uris, label=label_str,
+        total_products=total_products, total_categories=total_categories,
+        critical_count=critical_count, low_count=low_count,
     )
 
     try:
         send_email(html, subject)
         print(
             f"   ✅ '{group_label or 'All'}' email sent "
-            f"({total_products} products, {critical_count} out of stock).",
+            f"({total_products} products · {critical_count} out of stock).",
             flush=True,
         )
     except Exception as exc:
