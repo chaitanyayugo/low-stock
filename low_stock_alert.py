@@ -8,7 +8,6 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.mime.image import MIMEImage
 
 print("🟢 Starting ELITE low-stock alert script...", flush=True)
 
@@ -29,10 +28,6 @@ SMTP_TO       = os.environ.get("SMTP_TO")
 
 LOW_STOCK_THRESHOLD = 5
 
-# Gmail hard-caps at 500 attachments per email.
-# We stay at 450 to leave a safe buffer.
-MAX_IMAGES_PER_EMAIL = 450
-
 # Quantity fields to try in priority order
 QTY_FIELD_CANDIDATES = [
     "x_avl_custom",
@@ -40,13 +35,11 @@ QTY_FIELD_CANDIDATES = [
     "qty_available",
 ]
 
-# 1×1 transparent PNG fallback (for products with no image in Odoo)
-FALLBACK_B64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAA"
-    "DUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-)
+# Field that marks a product as imported (boolean True/False in Odoo)
+# Adjust this to your actual custom field name
+IMPORTED_FIELD = "x_is_imported"   # ← set to None to disable split
 
-# Deterministic colour palette — only used when a product has NO image in Odoo
+# Deterministic colour palette — used when a product has NO image in Odoo
 AVATAR_COLORS = [
     "#1d4ed8", "#0369a1", "#047857", "#7c3aed",
     "#b45309", "#be123c", "#0e7490", "#15803d",
@@ -65,17 +58,29 @@ def avatar_color(name: str) -> str:
     return AVATAR_COLORS[idx]
 
 
-def letter_avatar_html(name: str) -> str:
-    """Coloured initial — only used when a product genuinely has no image in Odoo."""
+def letter_avatar_b64_uri(name: str) -> str:
+    """
+    Returns a tiny inline SVG as a data URI — no attachment needed.
+    This replaces the old letter_avatar_html() approach.
+    """
     letter = (name or "?")[0].upper()
     color  = avatar_color(name)
-    return (
-        f'<div style="width:44px; height:44px; border-radius:10px; '
-        f'background:{color}; display:inline-block; text-align:center; '
-        f'line-height:44px; font-family:Helvetica,Arial,sans-serif; '
-        f'font-size:18px; font-weight:700; color:#fff;">'
-        f'{letter}</div>'
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="44" height="44">'
+        f'<rect width="44" height="44" rx="10" fill="{color}"/>'
+        f'<text x="22" y="31" text-anchor="middle" '
+        f'font-family="Helvetica,Arial,sans-serif" font-size="20" '
+        f'font-weight="700" fill="#fff">{letter}</text>'
+        f'</svg>'
     )
+    b64 = base64.b64encode(svg.encode()).decode()
+    return f"data:image/svg+xml;base64,{b64}"
+
+
+def img_to_data_uri(img_bytes: bytes) -> str:
+    """Convert raw image bytes to an inline base64 data URI (PNG assumed)."""
+    b64 = base64.b64encode(img_bytes).decode()
+    return f"data:image/png;base64,{b64}"
 
 
 def stock_badge(qty: float) -> str:
@@ -97,75 +102,56 @@ def stock_badge(qty: float) -> str:
         )
 
 
-def build_html(batch: list, qty_field: str, product_hash_map: dict,
-               part_label: str, total_products: int,
-               total_categories: int, critical_count: int, low_count: int) -> str:
-    """Build the full HTML email for one batch of products."""
-
+# ─────────────────────────────────────────────
+#  HTML BUILDER
+#  ✅ Images are now inline data URIs — ZERO attachments, zero gallery mess.
+#  ✅ Sortable/filterable dropdowns on Name, Category, Stock columns.
+# ─────────────────────────────────────────────
+def build_html(
+    products: list,
+    qty_field: str,
+    product_data_uris: dict,   # p_id → data URI string
+    label: str,
+    total_products: int,
+    total_categories: int,
+    critical_count: int,
+    low_count: int,
+) -> str:
     generated_at = utc_now().strftime("%d %b %Y • %H:%M UTC")
 
-    # Group this batch by category
-    categories: dict[str, list] = defaultdict(list)
-    for p in batch:
+    # Collect unique category names for the dropdown
+    cat_names = sorted({
+        (p["categ_id"][1] if p.get("categ_id") else "Uncategorised")
+        for p in products
+    })
+
+    # Build the JS data array — each product as a JS object literal
+    js_rows = []
+    for p in products:
+        p_id     = p["id"]
+        qty      = float(p.get(qty_field) or 0)
         cat_name = p["categ_id"][1] if p.get("categ_id") else "Uncategorised"
-        categories[cat_name].append(p)
+        name     = (p["name"] or "").replace("\\", "\\\\").replace("`", "\\`").replace("'", "\\'")
+        cat_esc  = cat_name.replace("\\", "\\\\").replace("'", "\\'")
+        uri      = product_data_uris.get(p_id, "")
+        js_rows.append(
+            f"{{id:{p_id},name:'{name}',cat:'{cat_esc}',qty:{qty},uri:`{uri}`}}"
+        )
 
-    sections_html = ""
-    for cat_name, cat_products in categories.items():
-        rows_html = ""
-        for p in cat_products:
-            p_id  = p["id"]
-            qty   = float(p.get(qty_field) or 0)
-            badge = stock_badge(qty)
+    js_data = ",\n    ".join(js_rows)
 
-            img_hash = product_hash_map.get(p_id)
-            if img_hash:
-                img_cell = (
-                    f'<div style="width:44px;height:44px;border-radius:10px;'
-                    f'overflow:hidden;background:#1e2433;display:inline-block;">'
-                    f'<img src="cid:img_{img_hash}" width="44" height="44" '
-                    f'style="width:44px;height:44px;object-fit:cover;display:block;" alt="">'
-                    f'</div>'
-                )
-            else:
-                # This product genuinely has no image stored in Odoo
-                img_cell = letter_avatar_html(p["name"] or "?")
+    # Category <option> tags
+    cat_options = "\n".join(
+        f'<option value="{c}">{c}</option>' for c in cat_names
+    )
 
-            rows_html += f"""
-            <tr>
-              <td style="padding:12px 16px;width:56px;text-align:center;vertical-align:middle;">
-                {img_cell}
-              </td>
-              <td style="padding:12px 8px;font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                         font-size:14px;color:#e2e8f0;font-weight:500;vertical-align:middle;">
-                {p['name']}
-              </td>
-              <td style="padding:12px 16px;text-align:center;vertical-align:middle;">
-                {badge}
-              </td>
-            </tr>
-            <tr>
-              <td colspan="3" style="padding:0;height:1px;
-                  background:linear-gradient(90deg,transparent,
-                  #2d3748 20%,#2d3748 80%,transparent);"></td>
-            </tr>"""
-
-        sections_html += f"""
-        <tr>
-          <td colspan="3" style="padding:24px 20px 8px;">
-            <div style="display:inline-block;background:#0f172a;border:1px solid #334155;
-                        border-radius:6px;padding:4px 14px;">
-              <span style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                           font-size:11px;font-weight:700;letter-spacing:1.5px;
-                           text-transform:uppercase;color:#94a3b8;">{cat_name}</span>
-              <span style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
-                           font-size:11px;color:#475569;margin-left:8px;">
-                {len(cat_products)} item{'s' if len(cat_products) != 1 else ''}
-              </span>
-            </div>
-          </td>
-        </tr>
-        {rows_html}"""
+    # Stock level options
+    stock_options = """
+      <option value="all">All</option>
+      <option value="out">Out of Stock (0)</option>
+      <option value="critical">Critical (1–2)</option>
+      <option value="low">Low (3–4)</option>
+    """
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -175,10 +161,12 @@ def build_html(batch: list, qty_field: str, product_hash_map: dict,
   <title>Low Stock Alert</title>
 </head>
 <body style="margin:0;padding:0;background:#060b14;">
+
 <table width="100%" cellpadding="0" cellspacing="0"
        style="background:#060b14;padding:32px 12px;">
   <tr><td align="center">
-  <table width="640" cellpadding="0" cellspacing="0" style="max-width:640px;width:100%;">
+  <table width="680" cellpadding="0" cellspacing="0"
+         style="max-width:680px;width:100%;">
 
     <!-- HEADER -->
     <tr>
@@ -197,7 +185,7 @@ def build_html(batch: list, qty_field: str, product_hash_map: dict,
                         line-height:1.2;margin-bottom:6px;">
               Low Stock Alert &nbsp;
               <span style="font-size:16px;color:#475569;font-weight:400;">
-                {part_label}
+                {label}
               </span>
             </div>
             <div style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
@@ -252,7 +240,48 @@ def build_html(batch: list, qty_field: str, product_hash_map: dict,
       </td>
     </tr>
 
-    <!-- PRODUCT TABLE -->
+    <!-- FILTER BAR -->
+    <tr>
+      <td style="background:#080f1e;border-left:1px solid #1e3a5f;
+                 border-right:1px solid #1e3a5f;border-top:1px solid #1e293b;
+                 padding:14px 20px;">
+        <table width="100%" cellpadding="0" cellspacing="0"><tr>
+          <!-- Name search -->
+          <td style="padding-right:8px;">
+            <input id="filterName" type="text" placeholder="🔍 Search name…"
+              oninput="renderTable()"
+              style="width:100%;box-sizing:border-box;background:#0f172a;
+                     border:1px solid #1e3a5f;border-radius:8px;
+                     padding:8px 12px;color:#e2e8f0;
+                     font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                     font-size:13px;outline:none;">
+          </td>
+          <!-- Category dropdown -->
+          <td style="padding-right:8px;white-space:nowrap;">
+            <select id="filterCat" onchange="renderTable()"
+              style="background:#0f172a;border:1px solid #1e3a5f;
+                     border-radius:8px;padding:8px 12px;color:#94a3b8;
+                     font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                     font-size:13px;outline:none;cursor:pointer;">
+              <option value="all">All Categories</option>
+              {cat_options}
+            </select>
+          </td>
+          <!-- Stock dropdown -->
+          <td style="white-space:nowrap;">
+            <select id="filterStock" onchange="renderTable()"
+              style="background:#0f172a;border:1px solid #1e3a5f;
+                     border-radius:8px;padding:8px 12px;color:#94a3b8;
+                     font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                     font-size:13px;outline:none;cursor:pointer;">
+              {stock_options}
+            </select>
+          </td>
+        </tr></table>
+      </td>
+    </tr>
+
+    <!-- PRODUCT TABLE (rendered by JS) -->
     <tr>
       <td style="background:#0a1628;border-left:1px solid #1e3a5f;
                  border-right:1px solid #1e3a5f;border-top:1px solid #1e293b;">
@@ -262,17 +291,29 @@ def build_html(batch: list, qty_field: str, product_hash_map: dict,
                 font-family:'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;
                 font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
                 color:#334155;">IMG</th>
-            <th style="padding:12px 8px;text-align:left;
+            <th style="padding:12px 8px;text-align:left;cursor:pointer;
                 font-family:'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;
                 font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
-                color:#334155;">Product</th>
-            <th width="110" style="padding:12px 16px;text-align:center;
+                color:#334155;" onclick="toggleSort('name')">
+              Product <span id="sortName"></span></th>
+            <th width="130" style="padding:12px 8px;text-align:left;cursor:pointer;
                 font-family:'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;
                 font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
-                color:#334155;">In Stock</th>
+                color:#334155;" onclick="toggleSort('cat')">
+              Category <span id="sortCat"></span></th>
+            <th width="100" style="padding:12px 16px;text-align:center;cursor:pointer;
+                font-family:'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;
+                font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
+                color:#334155;" onclick="toggleSort('qty')">
+              In Stock <span id="sortQty"></span></th>
           </tr>
-          {sections_html}
+          <tbody id="productBody"></tbody>
         </table>
+        <div id="noResults" style="display:none;text-align:center;
+             padding:32px;font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+             font-size:14px;color:#334155;">
+          No products match the current filters.
+        </div>
       </td>
     </tr>
 
@@ -299,31 +340,151 @@ def build_html(batch: list, qty_field: str, product_hash_map: dict,
   </table>
   </td></tr>
 </table>
+
+<!-- ── INTERACTIVE LOGIC ─────────────────────────────────────────── -->
+<script>
+  const ALL_PRODUCTS = [
+    {js_data}
+  ];
+
+  let sortKey = null;
+  let sortAsc = true;
+
+  function stockLevel(qty) {{
+    if (qty === 0)   return 'out';
+    if (qty <= 2)    return 'critical';
+    return 'low';
+  }}
+
+  function badgeHtml(qty) {{
+    if (qty === 0)
+      return '<span style="background:#1a0005;color:#ff4d6d;padding:4px 12px;border-radius:20px;font-weight:700;font-size:13px;letter-spacing:0.5px;">OUT</span>';
+    const col = qty <= 2 ? '#ff8c42' : '#52c41a';
+    const bg  = qty <= 2 ? '#1c0a00' : '#0a1a10';
+    return `<span style="background:${{bg}};color:${{col}};padding:4px 12px;border-radius:20px;font-weight:700;font-size:13px;">${{qty}}</span>`;
+  }}
+
+  function imgHtml(uri, name) {{
+    if (uri) {{
+      return `<div style="width:44px;height:44px;border-radius:10px;overflow:hidden;background:#1e2433;display:inline-block;"><img src="${{uri}}" width="44" height="44" style="width:44px;height:44px;object-fit:cover;display:block;" alt=""></div>`;
+    }}
+    // no image — inline SVG avatar
+    const colors=['#1d4ed8','#0369a1','#047857','#7c3aed','#b45309','#be123c','#0e7490','#15803d'];
+    let h=0; for(const c of name){{h=(h*31+c.charCodeAt(0))>>>0;}} const col=colors[h%colors.length];
+    const letter=(name||'?')[0].toUpperCase();
+    return `<div style="width:44px;height:44px;border-radius:10px;background:${{col}};display:inline-block;text-align:center;line-height:44px;font-family:Helvetica,Arial,sans-serif;font-size:18px;font-weight:700;color:#fff;">${{letter}}</div>`;
+  }}
+
+  function renderTable() {{
+    const nameQ  = document.getElementById('filterName').value.toLowerCase();
+    const catQ   = document.getElementById('filterCat').value;
+    const stockQ = document.getElementById('filterStock').value;
+
+    let rows = ALL_PRODUCTS.filter(p => {{
+      if (nameQ  && !p.name.toLowerCase().includes(nameQ)) return false;
+      if (catQ  !== 'all' && p.cat !== catQ)               return false;
+      if (stockQ !== 'all' && stockLevel(p.qty) !== stockQ) return false;
+      return true;
+    }});
+
+    if (sortKey) {{
+      rows.sort((a, b) => {{
+        let av = a[sortKey], bv = b[sortKey];
+        if (typeof av === 'string') av = av.toLowerCase();
+        if (typeof bv === 'string') bv = bv.toLowerCase();
+        return sortAsc ? (av < bv ? -1 : av > bv ? 1 : 0)
+                       : (av > bv ? -1 : av < bv ? 1 : 0);
+      }});
+    }}
+
+    const tbody = document.getElementById('productBody');
+    const noRes = document.getElementById('noResults');
+
+    if (rows.length === 0) {{
+      tbody.innerHTML = '';
+      noRes.style.display = 'block';
+      return;
+    }}
+    noRes.style.display = 'none';
+
+    // Group by category
+    const groups = {{}};
+    for (const p of rows) {{
+      (groups[p.cat] = groups[p.cat] || []).push(p);
+    }}
+
+    let html = '';
+    for (const [cat, items] of Object.entries(groups)) {{
+      html += `
+        <tr>
+          <td colspan="4" style="padding:24px 20px 8px;">
+            <div style="display:inline-block;background:#0f172a;border:1px solid #334155;
+                        border-radius:6px;padding:4px 14px;">
+              <span style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                           font-size:11px;font-weight:700;letter-spacing:1.5px;
+                           text-transform:uppercase;color:#94a3b8;">${{cat}}</span>
+              <span style="font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                           font-size:11px;color:#475569;margin-left:8px;">
+                ${{items.length}} item${{items.length !== 1 ? 's' : ''}}
+              </span>
+            </div>
+          </td>
+        </tr>`;
+      for (const p of items) {{
+        html += `
+          <tr>
+            <td style="padding:12px 16px;width:56px;text-align:center;vertical-align:middle;">
+              ${{imgHtml(p.uri, p.name)}}
+            </td>
+            <td style="padding:12px 8px;font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                       font-size:14px;color:#e2e8f0;font-weight:500;vertical-align:middle;">
+              ${{p.name}}
+            </td>
+            <td style="padding:12px 8px;font-family:'Segoe UI',Helvetica,Arial,sans-serif;
+                       font-size:12px;color:#64748b;vertical-align:middle;">
+              ${{p.cat}}
+            </td>
+            <td style="padding:12px 16px;text-align:center;vertical-align:middle;">
+              ${{badgeHtml(p.qty)}}
+            </td>
+          </tr>
+          <tr>
+            <td colspan="4" style="padding:0;height:1px;
+                background:linear-gradient(90deg,transparent,#2d3748 20%,#2d3748 80%,transparent);">
+            </td>
+          </tr>`;
+      }}
+    }}
+    tbody.innerHTML = html;
+  }}
+
+  function toggleSort(key) {{
+    if (sortKey === key) {{ sortAsc = !sortAsc; }}
+    else {{ sortKey = key; sortAsc = true; }}
+    ['name','cat','qty'].forEach(k => {{
+      document.getElementById('sort'+k.charAt(0).toUpperCase()+k.slice(1)).textContent =
+        sortKey === k ? (sortAsc ? ' ▲' : ' ▼') : '';
+    }});
+    renderTable();
+  }}
+
+  // Initial render
+  renderTable();
+</script>
+
 </body>
 </html>"""
 
 
-def send_email(html: str, batch_images: dict[str, bytes],
-               subject: str) -> None:
-    """Assemble and send one email with its CID image attachments."""
-    msg = MIMEMultipart("related")
+# ─────────────────────────────────────────────
+#  SEND EMAIL  (plain multipart/related, NO image attachments)
+# ─────────────────────────────────────────────
+def send_email(html: str, subject: str) -> None:
+    msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = SMTP_FROM
     msg["To"]      = SMTP_TO
-
-    alt = MIMEMultipart("alternative")
-    alt.attach(MIMEText(html, "html"))
-    msg.attach(alt)
-
-    for img_hash, img_bytes in batch_images.items():
-        try:
-            part = MIMEImage(img_bytes, _subtype="png")
-            part.add_header("Content-ID",          f"<img_{img_hash}>")
-            part.add_header("Content-Disposition", "inline",
-                            filename=f"img_{img_hash}.png")
-            msg.attach(part)
-        except Exception as exc:
-            print(f"   ⚠️  Could not attach image {img_hash}: {exc}", flush=True)
+    msg.attach(MIMEText(html, "html"))
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
         server.ehlo()
@@ -346,12 +507,17 @@ print("✅ Connected to Odoo", flush=True)
 
 
 # ─────────────────────────────────────────────
-#  2. AUTO-DETECT QUANTITY FIELD & FETCH ALL PRODUCTS
+#  2. AUTO-DETECT QUANTITY FIELD & FETCH PRODUCTS
 # ─────────────────────────────────────────────
-print("🔍 Detecting available quantity field...", flush=True)
+print("🔍 Detecting quantity field...", flush=True)
 
-products  = None
-qty_field = None
+all_products = None
+qty_field    = None
+
+# Decide which extra fields to pull
+extra_fields = ["id", "name", "categ_id", "image_128"]
+if IMPORTED_FIELD:
+    extra_fields.append(IMPORTED_FIELD)
 
 for candidate in QTY_FIELD_CANDIDATES:
     try:
@@ -364,40 +530,37 @@ for candidate in QTY_FIELD_CANDIDATES:
                 (candidate, "<", LOW_STOCK_THRESHOLD),
                 (candidate, ">=", 0),
             ]],
-            {
-                "fields": ["id", "name", "categ_id", "image_128", candidate],
-                "limit":  0,        # fetch ALL matching records
-            },
+            {"fields": extra_fields + [candidate], "limit": 0},
         )
-        products  = result
-        qty_field = candidate
+        all_products = result
+        qty_field    = candidate
         print(f"✅ Using quantity field: '{qty_field}'", flush=True)
         break
     except Exception as exc:
         print(f"   ⚠️  Field '{candidate}' unavailable: {exc}", flush=True)
 
-if products is None or qty_field is None:
+if all_products is None or qty_field is None:
     print("❌ None of the quantity fields worked. Aborting.", flush=True)
     sys.exit(1)
 
-# Safety filter — drop nulls / False that slipped through
-products = [
-    p for p in products
+# Safety filter
+all_products = [
+    p for p in all_products
     if p.get(qty_field) not in (None, False)
     and float(p[qty_field]) < LOW_STOCK_THRESHOLD
 ]
 
-if not products:
-    print("✅ No low-stock products found. Exiting gracefully.", flush=True)
+if not all_products:
+    print("✅ No low-stock products found. Exiting.", flush=True)
     sys.exit(0)
 
-print(f"📦 Found {len(products)} low-stock product(s).", flush=True)
+print(f"📦 Found {len(all_products)} low-stock product(s).", flush=True)
 
 
 # ─────────────────────────────────────────────
-#  3. SORT: category → name → stock qty
+#  3. SORT
 # ─────────────────────────────────────────────
-products.sort(key=lambda p: (
+all_products.sort(key=lambda p: (
     (p["categ_id"][1] if p.get("categ_id") else "zzz").lower(),
     (p["name"] or "").lower(),
     float(p.get(qty_field) or 0),
@@ -405,17 +568,15 @@ products.sort(key=lambda p: (
 
 
 # ─────────────────────────────────────────────
-#  4. DECODE & DEDUPLICATE IMAGES
-#     image_128 is already in the search_read payload — zero extra API calls.
-#     hash_to_bytes  : img_hash → raw PNG bytes  (unique images only)
-#     product_hash_map: p_id    → img_hash | None
+#  4. DECODE IMAGES → DATA URIs  (no attachments)
 # ─────────────────────────────────────────────
-print("🖼️  Deduplicating product images...", flush=True)
+print("🖼️  Converting images to data URIs...", flush=True)
 
-hash_to_bytes:    dict[str, bytes]      = {}
-product_hash_map: dict[int, str | None] = {}
+# Deduplicate: bytes hash → data URI, then map p_id → data URI
+hash_to_uri:      dict[str, str]      = {}
+product_data_uris: dict[int, str]     = {}
 
-for p in products:
+for p in all_products:
     p_id    = p["id"]
     raw_img = p.get("image_128")
     try:
@@ -424,105 +585,85 @@ for p in products:
             img_str   = img_str.replace("\n", "").replace("\r", "").strip()
             img_bytes = base64.b64decode(img_str)
             img_hash  = hashlib.md5(img_bytes).hexdigest()
-            hash_to_bytes[img_hash]  = img_bytes
-            product_hash_map[p_id]   = img_hash
+            if img_hash not in hash_to_uri:
+                hash_to_uri[img_hash] = img_to_data_uri(img_bytes)
+            product_data_uris[p_id] = hash_to_uri[img_hash]
         else:
-            product_hash_map[p_id] = None      # no image in Odoo → letter avatar
+            product_data_uris[p_id] = ""    # JS will render a letter avatar
     except Exception as exc:
         print(f"   ⚠️  Bad image for product {p_id}: {exc}", flush=True)
-        product_hash_map[p_id] = None
+        product_data_uris[p_id] = ""
 
-unique_total = len(hash_to_bytes)
 print(
-    f"   ↳ {len(products)} products → {unique_total} unique image(s).",
+    f"   ↳ {len(all_products)} products → {len(hash_to_uri)} unique image(s).",
     flush=True,
 )
 
 
 # ─────────────────────────────────────────────
-#  5. SMART-BATCH  (image-count aware)
-#
-#  Walk through the sorted product list and keep filling the current batch.
-#  The moment adding a new product's image would push unique images over
-#  MAX_IMAGES_PER_EMAIL, seal the current batch and open a new one.
-#  This guarantees every email stays within Gmail's 500-attachment limit
-#  while keeping categories together as much as possible.
+#  5. SPLIT INTO IMPORTED / NON-IMPORTED
 # ─────────────────────────────────────────────
-batches:        list[list]           = []
-batch_img_sets: list[dict[str, bytes]] = []
+def split_products(products):
+    if not IMPORTED_FIELD:
+        return None, products   # feature disabled → send everything as "non-imported"
 
-cur_batch:  list  = []
-cur_hashes: dict[str, bytes] = {}
+    imported     = [p for p in products if p.get(IMPORTED_FIELD)]
+    non_imported = [p for p in products if not p.get(IMPORTED_FIELD)]
+    return imported, non_imported
 
-for p in products:
-    img_hash = product_hash_map.get(p["id"])
 
-    # Would this image push us over the limit?
-    if img_hash and img_hash not in cur_hashes and len(cur_hashes) >= MAX_IMAGES_PER_EMAIL:
-        # Seal current batch
-        batches.append(cur_batch)
-        batch_img_sets.append(cur_hashes)
-        cur_batch  = []
-        cur_hashes = {}
+imported_products, non_imported_products = split_products(all_products)
 
-    cur_batch.append(p)
-    if img_hash:
-        cur_hashes[img_hash] = hash_to_bytes[img_hash]
-
-# Seal the final batch
-if cur_batch:
-    batches.append(cur_batch)
-    batch_img_sets.append(cur_hashes)
-
-total_batches    = len(batches)
-total_products   = len(products)
-total_categories = len({p["categ_id"][0] for p in products if p.get("categ_id")})
-critical_count   = sum(1 for p in products if float(p.get(qty_field) or 0) == 0)
-low_count        = total_products - critical_count
-
-print(
-    f"   ↳ Split into {total_batches} email(s) "
-    f"(max {MAX_IMAGES_PER_EMAIL} unique images each).",
-    flush=True,
-)
+groups = []
+if IMPORTED_FIELD:
+    if imported_products:
+        groups.append(("Imported",     imported_products))
+    if non_imported_products:
+        groups.append(("Non-Imported", non_imported_products))
+else:
+    groups.append(("", non_imported_products))  # single email, no label
 
 
 # ─────────────────────────────────────────────
-#  6. BUILD & SEND ONE EMAIL PER BATCH
+#  6. BUILD & SEND ONE EMAIL PER GROUP
 # ─────────────────────────────────────────────
 print(f"📤 Sending to {SMTP_TO}...", flush=True)
 
-for i, (batch, batch_imgs) in enumerate(zip(batches, batch_img_sets), start=1):
-    part_label = f"Part {i}/{total_batches}" if total_batches > 1 else ""
+for group_label, products in groups:
+    total_products   = len(products)
+    total_categories = len({p["categ_id"][0] for p in products if p.get("categ_id")})
+    critical_count   = sum(1 for p in products if float(p.get(qty_field) or 0) == 0)
+    low_count        = total_products - critical_count
+
+    label_str = f"[{group_label}]" if group_label else ""
 
     subject = (
-        f"⚠️ Low Stock Alert"
-        + (f" [{part_label}]" if part_label else "")
-        + f" — {total_products} product{'s' if total_products != 1 else ''}"
-        + f" · {critical_count} out of stock"
-        + f" · {utc_now().strftime('%d %b %Y')}"
+        f"⚠️ Low Stock Alert {label_str}"
+        f" — {total_products} product{'s' if total_products != 1 else ''}"
+        f" · {critical_count} out of stock"
+        f" · {utc_now().strftime('%d %b %Y')}"
     )
 
     html = build_html(
-        batch         = batch,
-        qty_field     = qty_field,
-        product_hash_map = product_hash_map,
-        part_label    = part_label,
-        total_products   = total_products,
-        total_categories = total_categories,
-        critical_count   = critical_count,
-        low_count        = low_count,
+        products          = products,
+        qty_field         = qty_field,
+        product_data_uris = product_data_uris,
+        label             = label_str,
+        total_products    = total_products,
+        total_categories  = total_categories,
+        critical_count    = critical_count,
+        low_count         = low_count,
     )
 
     try:
-        send_email(html, batch_imgs, subject)
+        send_email(html, subject)
         print(
-            f"   ✅ Email {i}/{total_batches} sent "
-            f"({len(batch)} products · {len(batch_imgs)} image attachment(s)).",
+            f"   ✅ '{group_label or 'All'}' email sent "
+            f"({total_products} products, {critical_count} out of stock).",
             flush=True,
         )
     except Exception as exc:
-        print(f"   ❌ Email {i}/{total_batches} failed: {exc}", flush=True)
+        print(f"   ❌ '{group_label or 'All'}' email failed: {exc}", flush=True)
         sys.exit(1)
 
 print("✅ All emails sent successfully!", flush=True)
