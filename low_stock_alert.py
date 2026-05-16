@@ -33,7 +33,7 @@ if not uid:
 models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 print("✅ Connected to Odoo", flush=True)
 
-# ---------- 2. FETCH LOW STOCK QUANTS (STRICTLY CAPPED AT 1) ----------
+# ---------- 2. FETCH LOW STOCK QUANTS ----------
 print("📦 Fetching exactly 1 low-stock record for testing...", flush=True)
 domain = [
     ("location_id.usage", "=", "internal"),
@@ -48,13 +48,12 @@ quants = models.execute_kw(
     "search_read",
     [domain],
     {
-        # REMOVED reserved_quantity HERE
         "fields": ["id", "product_id", "location_id", "quantity"], 
-        "limit": 1  # 🔴 THIS TELLS ODOO TO ONLY GIVE BACK 1 RESULT
+        "limit": 1  
     }
 )
 
-quants = quants[:1] # Double enforce limit locally
+quants = quants[:1] 
 
 if not quants:
     print("✅ No low-stock products found. Exiting gracefully.", flush=True)
@@ -64,8 +63,8 @@ product_ids = list({q["product_id"][0] for q in quants if q["product_id"]})
 total_products = len(product_ids)
 print(f"📦 Found {len(quants)} low-stock record. Will process {total_products} unique product.", flush=True)
 
-# ---------- 3. BULK FETCH IMAGE VIA XML-RPC (CRASH-PROOFED) ----------
-print("🖼️ Fetching product image...", flush=True)
+# ---------- 3. BULK FETCH IMAGE VIA XML-RPC ----------
+print("🖼️ Fetching and sanitizing product image...", flush=True)
 
 product_data = models.execute_kw(
     ODOO_DB,
@@ -78,28 +77,30 @@ product_data = models.execute_kw(
 )
 
 product_image_map = {}
-# Base64 fallback (a transparent 1x1 pixel) so the HTML tag always renders properly
 fallback_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 
 for p in product_data:
     p_id = p["id"]
     try:
         raw_img = p.get("image_128")
-        if raw_img:
-            # Handle Py3 bytes conversion or string conversion depending on Odoo python environments
+        
+        # Check if Odoo returned actual data (and NOT the boolean 'False')
+        if raw_img and str(raw_img) != 'False':
+            
+            # Handle Py3 bytes conversion
             if isinstance(raw_img, bytes):
                 img_str = raw_img.decode("utf-8")
             else:
                 img_str = str(raw_img)
             
-            # Make sure it isn't boolean 'False' masquerading as text
-            if img_str == 'False' or not img_str:
-                img_str = fallback_b64
+            # 🔴 CRITICAL FIX: Strip invisible newlines so email rendering doesn't crash
+            img_str = img_str.replace('\n', '').replace('\r', '').strip()
         else:
             img_str = fallback_b64
+            
     except Exception as e:
-        print(f"⚠️ Safe fail! Image read issue on Product ID {p_id}. Details: {e}")
-        img_str = fallback_b64 # Use invisible box so the layout doesn't tear
+        print(f"⚠️ Safe fail! Image read issue on Product ID {p_id}. Error: {e}")
+        img_str = fallback_b64 
         
     product_image_map[p_id] = f"data:image/png;base64,{img_str}"
 
@@ -113,16 +114,14 @@ for q in quants:
     product_name = q["product_id"][1]
     location_name = q["location_id"][1] if q["location_id"] else "Unknown"
     
-    # Cast to int visually where `.0` floats usually hang on Odoo values
     quantity_fmt = f"{float(q['quantity']):g}" 
 
     img_src = product_image_map.get(product_id, f"data:image/png;base64,{fallback_b64}")
 
-    # REMOVED RESERVED COLUMN IN ROW DATA
     rows += f"""
     <tr style="border-bottom:1px solid #eee;">
         <td style="padding:12px 15px; text-align:center;">
-            <img src="{img_src}" style="width:40px; height:40px; object-fit:cover; border-radius:6px;" alt="IMG">
+            <img src="{img_src}" style="width:40px; height:40px; object-fit:cover; border-radius:6px; background-color:#f9fafb;" alt="Img">
         </td>
         <td style="padding:12px 15px; font-family:Helvetica; font-size:14px; font-weight:500;">
             {product_name}
@@ -154,7 +153,6 @@ full_html = f"""
           <th style="padding:15px; text-align:left;">Product Name</th>
           <th style="padding:15px; text-align:left;">Location</th>
           <th style="padding:15px; text-align:center;">In Stock</th>
-          <!-- REMOVED RESERVED HEADER HERE -->
         </tr>
       </thead>
       <tbody>
